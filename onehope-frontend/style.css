@@ -548,11 +548,12 @@ textarea::placeholder { color: var(--text-light); }
   font-weight: 600;
   margin: 0;
   text-align: center;
+  color: #1a1a2e;
 }
 
 .auth-subtitle {
   font-size: 0.875rem;
-  color: var(--text-secondary, #666);
+  color: #555555;
   text-align: center;
   margin: 0;
   line-height: 1.5;
@@ -655,5 +656,13 @@ textarea::placeholder { color: var(--text-light); }
 
 .status-pill.offline .dot {
   background: #f44336;
+}
+
+.auth-logo .brand {
+  color: #1a1a2e;
+}
+
+.auth-logo .tagline {
+  color: #666666;
 }
 
