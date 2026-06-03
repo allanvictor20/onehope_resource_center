@@ -60,10 +60,10 @@ GROQ_TIMEOUT     = 30     # seconds
 
 # Groq model preference list — first available is used
 GROQ_MODELS = [
-    "llama-3.3-70b-versatile",
-    "llama-3.1-70b-versatile",
-    "llama-4-scout",      # Great addition: Groq's fast reasoning model
-    "mixtral-8x7b-32768", # Reliable, high-context fallback
+    "llama-3.3-70b-versatile",  # Primary heavy-lifter (128k context)
+    "openai/gpt-oss-120b",      # Exceptional fallback for deep reasoning tasks
+    "qwen/qwen3-32b",           # High-speed mid-weight fallback (replaces Mixtral)
+    "llama-4-scout",            # Extremely fast, highly optimized safety net
 ]
 # ── TF-IDF SEARCH INDEX ───────────────────────────────────────────────────────
 
