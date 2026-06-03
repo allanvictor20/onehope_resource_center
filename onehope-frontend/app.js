@@ -6,7 +6,7 @@ const BACKEND_URL = 'https://onehope-resource-center.onrender.com';
 // ── GOOGLE SIGN-IN CONFIG ─────────────────────────────────────────────────────
 // Set to your Google OAuth 2.0 Client ID (same value as in index.html meta tag).
 // Leave as empty string '' to disable auth (useful for local dev / no auth setup).
-const GOOGLE_CLIENT_ID = 'YOUR_GOOGLE_CLIENT_ID';
+const GOOGLE_CLIENT_ID = '946060102540-1ch6c5ipb4l6uv25efo67jtuej74nppi.apps.googleusercontent.com';
 
 // ── STATE ────────────────────────────────────────────────────────────────────
 let conversationHistory = [];
