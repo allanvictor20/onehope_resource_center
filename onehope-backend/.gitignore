@@ -1,0 +1,18 @@
+# Secrets — NEVER commit these
+.env
+service_account.json
+
+# Search index (regenerate with indexer.py)
+search_index.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db

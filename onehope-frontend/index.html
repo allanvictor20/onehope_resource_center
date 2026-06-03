@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>OneHope Resource Centre</title>
+  <link href="https://fonts.googleapis.com/css2?family=Sora:wght@300;400;500;600;700&family=Lora:ital,wght@0,400;0,600;1,400&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- Sidebar overlay (mobile) -->
+<div class="sidebar-overlay" id="sidebarOverlay" onclick="toggleSidebar()"></div>
+
+<!-- Sidebar -->
+<aside class="sidebar" id="sidebar">
+  <div class="sidebar-logo">
+    <div class="logo-circle">O</div>
+    <div class="logo-text">
+      <div class="brand"><span>One</span>Hope</div>
+      <div class="tagline">God's Word. Every Child.</div>
+    </div>
+  </div>
+  <button class="sidebar-new-chat" onclick="newChat()">
+    <svg viewBox="0 0 24 24"><path d="M19 11H13V5a1 1 0 0 0-2 0v6H5a1 1 0 0 0 0 2h6v6a1 1 0 0 0 2 0v-6h6a1 1 0 0 0 0-2z"/></svg>
+    New Conversation
+  </button>
+  <div class="sidebar-section-label">Recent</div>
+  <div class="sidebar-chats" id="sidebarChats">
+    <div class="no-history">No conversations yet</div>
+  </div>
+  <div class="sidebar-footer">
+    <div class="model-badge">
+      <div class="dot"></div>
+      <span>Powered by Llama 3.3 · Groq</span>
+    </div>
+  </div>
+</aside>
+
+<!-- Main -->
+<div class="main">
+
+  <!-- Top bar -->
+  <div class="topbar">
+    <button class="menu-btn" onclick="toggleSidebar()">
+      <svg viewBox="0 0 24 24"><path d="M3 18h18v-2H3v2zm0-5h18v-2H3v2zm0-7v2h18V6H3z"/></svg>
+    </button>
+    <div class="topbar-title" id="topbarTitle">OneHope Resource Centre</div>
+    <div class="topbar-actions">
+      <div class="status-pill">
+        <div class="dot"></div>
+        <span>Live</span>
+      </div>
+      <button class="icon-btn" title="New conversation" onclick="newChat()">
+        <svg viewBox="0 0 24 24"><path d="M19 11H13V5a1 1 0 0 0-2 0v6H5a1 1 0 0 0 0 2h6v6a1 1 0 0 0 2 0v-6h6a1 1 0 0 0 0-2z"/></svg>
+      </button>
+    </div>
+  </div>
+
+  <!-- Messages -->
+  <div class="messages-wrap" id="messagesWrap">
+    <div class="messages-inner" id="messages">
+      <div class="welcome-screen" id="welcomeScreen">
+        <div class="welcome-icon"><span>O</span></div>
+        <h2>Welcome to <em>OneHope</em> Resources</h2>
+        <p>I know every resource in the OneHope library — manuals, VDS documents, training materials, movies, brochures and more. Ask me anything and I'll find it for you.</p>
+        <div class="suggestion-grid">
+          <button class="suggestion-card" onclick="sendSuggestion(this)">
+            <span class="s-icon">🌱</span>
+            <span class="s-text">I'm a new volunteer — walk me through OneHope's main programmes</span>
+          </button>
+          <button class="suggestion-card" onclick="sendSuggestion(this)">
+            <span class="s-icon">🎬</span>
+            <span class="s-text">What movies does OneHope have available?</span>
+          </button>
+          <button class="suggestion-card" onclick="sendSuggestion(this)">
+            <span class="s-icon">📣</span>
+            <span class="s-text">Get me vision casting materials for Pastors</span>
+          </button>
+          <button class="suggestion-card" onclick="sendSuggestion(this)">
+            <span class="s-icon">🌍</span>
+            <span class="s-text">What resources do we have in Luganda?</span>
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Input -->
+  <div class="input-section">
+    <div class="input-outer">
+      <div class="input-box">
+        <textarea id="userInput" placeholder="Ask me anything about OneHope resources…" rows="1"></textarea>
+        <button class="send-btn" id="sendBtn" onclick="sendMessage()">
+          <svg viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
+        </button>
+      </div>
+      <div class="input-hint">
+        <span>Llama 3.3 · Groq</span>
+        <span class="hint-sep">·</span>
+        <span>Resources from Google Sheets</span>
+        <span class="hint-sep">·</span>
+        <span>Smart keyword search</span>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<!-- JS loaded at end of body so DOM is ready -->
+<script src="app.js"></script>
+</body>
+</html>
