@@ -1,7 +1,7 @@
 // ── BACKEND CONFIG ────────────────────────────────────────────────────────────
 // Local development:  http://localhost:8000
 // Production:        https://your-app.onrender.com   ← update this when deployed
-const BACKEND_URL = 'http://localhost:8000';
+const BACKEND_URL = 'https://onehope-resource-center.onrender.com';
 
 // ── GOOGLE SIGN-IN CONFIG ─────────────────────────────────────────────────────
 // Set to your Google OAuth 2.0 Client ID (same value as in index.html meta tag).
