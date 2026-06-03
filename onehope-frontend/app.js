@@ -1,19 +1,233 @@
-// ── BACKEND CONFIG ──
-// Local development: http://localhost:8000
-// Production: https://your-deployed-url.com
+// ── BACKEND CONFIG ────────────────────────────────────────────────────────────
+// Local development:  http://localhost:8000
+// Production:        https://your-app.onrender.com   ← update this when deployed
 const BACKEND_URL = 'http://localhost:8000';
 
-// ── STATE ──
+// ── GOOGLE SIGN-IN CONFIG ─────────────────────────────────────────────────────
+// Set to your Google OAuth 2.0 Client ID (same value as in index.html meta tag).
+// Leave as empty string '' to disable auth (useful for local dev / no auth setup).
+const GOOGLE_CLIENT_ID = 'YOUR_GOOGLE_CLIENT_ID';
+
+// ── STATE ────────────────────────────────────────────────────────────────────
 let conversationHistory = [];
 let currentChatId = null;
 let currentChatTitle = null;
 let isLoading = false;
 let _pendingMessages = [];
+let _googleIdToken = null;       // stored after sign-in
 
-// Chat sessions persisted in localStorage
-let chatSessions = JSON.parse(localStorage.getItem('onehope_chats') || '[]');
+// Chat sessions persisted in localStorage — capped at MAX_STORED_CHATS
+const MAX_STORED_CHATS = 20;
+let chatSessions = _loadSessions();
 
-// ── WELCOME SCREEN HTML (reused by newChat) ──
+// ── LOCALSTORAGE HELPERS ─────────────────────────────────────────────────────
+
+function _loadSessions() {
+  try {
+    return JSON.parse(localStorage.getItem('onehope_chats') || '[]');
+  } catch {
+    return [];
+  }
+}
+
+function saveSessions() {
+  // FIX: cap stored chats at MAX_STORED_CHATS to prevent localStorage overflow
+  if (chatSessions.length > MAX_STORED_CHATS) {
+    chatSessions = chatSessions.slice(-MAX_STORED_CHATS);
+  }
+  try {
+    localStorage.setItem('onehope_chats', JSON.stringify(chatSessions));
+  } catch (e) {
+    // Storage full — trim aggressively and retry
+    chatSessions = chatSessions.slice(-5);
+    try {
+      localStorage.setItem('onehope_chats', JSON.stringify(chatSessions));
+    } catch {
+      console.warn('localStorage full even after trimming — chat history will not persist.');
+    }
+  }
+  renderSidebar();
+}
+
+
+// ── GOOGLE SIGN-IN ────────────────────────────────────────────────────────────
+
+function initAuth() {
+  // If no Client ID configured, skip auth entirely
+  if (!GOOGLE_CLIENT_ID || GOOGLE_CLIENT_ID === 'YOUR_GOOGLE_CLIENT_ID') {
+    console.log('Auth disabled (no GOOGLE_CLIENT_ID configured).');
+    showApp();
+    return;
+  }
+
+  // Check if we have a cached token that's still valid
+  const cached = _loadCachedAuth();
+  if (cached) {
+    _googleIdToken = cached.token;
+    _setSignedInUser(cached.name, cached.picture, cached.email);
+    showApp();
+    return;
+  }
+
+  // Show sign-in overlay
+  document.getElementById('authOverlay').style.display = 'flex';
+  document.getElementById('mainApp').style.display = 'none';
+
+  // Render Google button
+  google.accounts.id.initialize({
+    client_id: GOOGLE_CLIENT_ID,
+    callback: handleGoogleSignIn,
+    auto_select: false,
+  });
+
+  google.accounts.id.renderButton(
+    document.getElementById('googleSignInBtn'),
+    {
+      theme: 'outline',
+      size: 'large',
+      width: 280,
+      text: 'signin_with',
+    }
+  );
+}
+
+function handleGoogleSignIn(response) {
+  const token = response.credential;
+
+  // Decode JWT payload (base64) — client-side only for display purposes.
+  // Real verification happens on the backend.
+  try {
+    const payload = JSON.parse(atob(token.split('.')[1]));
+    const { name, picture, email, exp } = payload;
+
+    // Check expiry client-side
+    if (Date.now() / 1000 > exp) {
+      showAuthError('Sign-in token expired. Please try again.');
+      return;
+    }
+
+    _googleIdToken = token;
+    _cacheAuth({ token, name, picture, email, exp });
+    _setSignedInUser(name, picture, email);
+
+    document.getElementById('authOverlay').style.display = 'none';
+    showApp();
+  } catch (e) {
+    showAuthError('Sign-in failed. Please try again.');
+  }
+}
+
+function showAuthError(msg) {
+  const el = document.getElementById('authError');
+  el.textContent = msg;
+  el.style.display = 'block';
+}
+
+function _setSignedInUser(name, picture, email) {
+  document.getElementById('signedInUser').style.display = 'flex';
+  document.getElementById('userNameLabel').textContent = name || email || '';
+  if (picture) document.getElementById('userAvatar').src = picture;
+}
+
+function signOut() {
+  _googleIdToken = null;
+  localStorage.removeItem('onehope_auth');
+
+  if (GOOGLE_CLIENT_ID && GOOGLE_CLIENT_ID !== 'YOUR_GOOGLE_CLIENT_ID') {
+    google.accounts.id.disableAutoSelect();
+    // Reload to show sign-in screen
+    location.reload();
+  }
+}
+
+function _cacheAuth(data) {
+  try {
+    localStorage.setItem('onehope_auth', JSON.stringify(data));
+  } catch { /* ignore */ }
+}
+
+function _loadCachedAuth() {
+  try {
+    const raw = localStorage.getItem('onehope_auth');
+    if (!raw) return null;
+    const data = JSON.parse(raw);
+    // Reject if within 5 minutes of expiry
+    if (!data.exp || Date.now() / 1000 > data.exp - 300) {
+      localStorage.removeItem('onehope_auth');
+      return null;
+    }
+    return data;
+  } catch {
+    return null;
+  }
+}
+
+function showApp() {
+  document.getElementById('mainApp').style.display = '';
+  renderSidebar();
+}
+
+// ── AUTH HEADER HELPER ────────────────────────────────────────────────────────
+
+function _authHeaders() {
+  const headers = { 'Content-Type': 'application/json' };
+  if (_googleIdToken) headers['Authorization'] = `Bearer ${_googleIdToken}`;
+  return headers;
+}
+
+
+// ── RE-INDEX BUTTON ───────────────────────────────────────────────────────────
+
+async function triggerReindex() {
+  const btn = document.getElementById('reindexBtn');
+  const label = document.getElementById('reindexLabel');
+
+  btn.disabled = true;
+  label.textContent = 'Refreshing…';
+
+  try {
+    const res = await fetch(`${BACKEND_URL}/reindex`, {
+      method: 'POST',
+      headers: _authHeaders(),
+    });
+    const data = await res.json();
+
+    if (data.status === 'already_running') {
+      label.textContent = 'Already running…';
+    } else {
+      label.textContent = 'Refresh started!';
+      // Poll index-status until done
+      _pollReindexStatus();
+    }
+  } catch {
+    label.textContent = 'Failed — server offline?';
+  }
+
+  setTimeout(() => {
+    btn.disabled = false;
+    label.textContent = 'Refresh Index';
+  }, 5000);
+}
+
+function _pollReindexStatus() {
+  const interval = setInterval(async () => {
+    try {
+      const res = await fetch(`${BACKEND_URL}/index-status`);
+      const data = await res.json();
+      if (!data.in_progress) {
+        clearInterval(interval);
+        const label = document.getElementById('statusLabel');
+        if (label) label.textContent = `${data.total_chunks} chunks`;
+        console.log('✅ Re-index complete.');
+      }
+    } catch {
+      clearInterval(interval);
+    }
+  }, 3000);
+}
+
+
+// ── WELCOME SCREEN HTML (reused by newChat) ───────────────────────────────────
 const WELCOME_HTML = `
   <div class="welcome-screen" id="welcomeScreen">
     <div class="welcome-icon"><span>O</span></div>
@@ -40,7 +254,7 @@ const WELCOME_HTML = `
   </div>
 `;
 
-// ── SIDEBAR ──
+// ── SIDEBAR ──────────────────────────────────────────────────────────────────
 function toggleSidebar() {
   document.getElementById('sidebar').classList.toggle('open');
   document.getElementById('sidebarOverlay').classList.toggle('show');
@@ -53,7 +267,6 @@ function closeSidebarMobile() {
   }
 }
 
-// ── RENDER SIDEBAR HISTORY ──
 function renderSidebar() {
   const container = document.getElementById('sidebarChats');
   if (chatSessions.length === 0) {
@@ -88,12 +301,8 @@ function deleteChat(e, id) {
   else renderSidebar();
 }
 
-function saveSessions() {
-  localStorage.setItem('onehope_chats', JSON.stringify(chatSessions));
-  renderSidebar();
-}
+// ── LOAD A PAST CHAT ──────────────────────────────────────────────────────────
 
-// ── LOAD A PAST CHAT ──
 function loadChat(id) {
   const session = chatSessions.find(s => s.id === id);
   if (!session) return;
@@ -107,7 +316,9 @@ function loadChat(id) {
 
   const messagesEl = document.getElementById('messages');
   messagesEl.innerHTML = '';
-  session.messages.forEach(msg => {
+
+  // FIX: session.messages may not exist if this is an old saved chat
+  (session.messages || []).forEach(msg => {
     if (msg.role === 'user') appendUserBubble(msg.content);
     else appendAiBubble(msg.content, msg.sources || [], [], false);
   });
@@ -117,7 +328,8 @@ function loadChat(id) {
   closeSidebarMobile();
 }
 
-// ── NEW CHAT ──
+// ── NEW CHAT ──────────────────────────────────────────────────────────────────
+
 function newChat() {
   saveCurrentChat();
   currentChatId = null;
@@ -130,10 +342,14 @@ function newChat() {
 
   renderSidebar();
   closeSidebarMobile();
-  document.getElementById('userInput').focus();
+
+  // FIX: only focus if element exists (it always should, but guard anyway)
+  const input = document.getElementById('userInput');
+  if (input) input.focus();
 }
 
-// ── SAVE CURRENT CHAT ──
+// ── SAVE CURRENT CHAT ─────────────────────────────────────────────────────────
+
 function saveCurrentChat() {
   if (!currentChatId || _pendingMessages.length === 0) return;
   const existing = chatSessions.find(s => s.id === currentChatId);
@@ -152,7 +368,8 @@ function saveCurrentChat() {
   saveSessions();
 }
 
-// ── DOM HELPERS ──
+// ── DOM HELPERS ───────────────────────────────────────────────────────────────
+
 function escapeHtml(str) {
   return String(str)
     .replace(/&/g, '&amp;')
@@ -170,7 +387,7 @@ function formatText(text) {
 
 function scrollToBottom() {
   const wrap = document.getElementById('messagesWrap');
-  wrap.scrollTop = wrap.scrollHeight;
+  if (wrap) wrap.scrollTop = wrap.scrollHeight;
 }
 
 function hideWelcome() {
@@ -178,7 +395,8 @@ function hideWelcome() {
   if (ws) ws.style.display = 'none';
 }
 
-// ── APPEND BUBBLES ──
+// ── APPEND BUBBLES ────────────────────────────────────────────────────────────
+
 function appendUserBubble(text) {
   const el = document.createElement('div');
   el.className = 'msg-group';
@@ -206,8 +424,7 @@ function appendAiBubble(text, sources, suggestions, needsClarification) {
     const pillClass = needsClarification ? 'ai-clarification-pill' : 'ai-suggestion-pill';
     pillsHTML = '<div class="ai-suggestions">';
     suggestions.forEach(s => {
-      const escaped = escapeHtml(s);
-      pillsHTML += `<button class="${pillClass}" onclick="sendSuggestionText(this)">${escaped}</button>`;
+      pillsHTML += `<button class="${pillClass}" onclick="sendSuggestionText(this)">${escapeHtml(s)}</button>`;
     });
     pillsHTML += '</div>';
   }
@@ -264,7 +481,8 @@ function removeTypingIndicator() {
   if (el) el.remove();
 }
 
-// ── SUGGESTIONS ──
+// ── SUGGESTIONS ───────────────────────────────────────────────────────────────
+
 function sendSuggestion(btn) {
   const text = btn.querySelector('.s-text');
   if (!text) return;
@@ -277,7 +495,8 @@ function sendSuggestionText(btn) {
   sendMessage();
 }
 
-// ── MAIN SEND ──
+// ── MAIN SEND ─────────────────────────────────────────────────────────────────
+
 async function sendMessage() {
   if (isLoading) return;
   const input = document.getElementById('userInput');
@@ -305,7 +524,7 @@ async function sendMessage() {
   try {
     const response = await fetch(`${BACKEND_URL}/chat`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: _authHeaders(),
       body: JSON.stringify({
         message: userText,
         conversation_history: conversationHistory
@@ -315,7 +534,11 @@ async function sendMessage() {
     const data = await response.json();
     removeTypingIndicator();
 
-    if (!response.ok) {
+    if (response.status === 401 || response.status === 403) {
+      // Token expired — prompt re-sign-in
+      localStorage.removeItem('onehope_auth');
+      appendErrorBubble('Your session has expired. Please refresh the page and sign in again.');
+    } else if (!response.ok) {
       appendErrorBubble(data.detail || 'An error occurred on the server.');
     } else {
       const replyText = data.answer || "Sorry, I couldn't generate a response.";
@@ -343,7 +566,8 @@ async function sendMessage() {
   input.focus();
 }
 
-// ── TEXTAREA AUTO-RESIZE ──
+// ── TEXTAREA AUTO-RESIZE ──────────────────────────────────────────────────────
+
 document.getElementById('userInput').addEventListener('input', function () {
   this.style.height = 'auto';
   this.style.height = Math.min(this.scrollHeight, 120) + 'px';
@@ -356,10 +580,27 @@ document.getElementById('userInput').addEventListener('keydown', function (e) {
   }
 });
 
-// ── INIT ──
-renderSidebar();
+// ── INIT ──────────────────────────────────────────────────────────────────────
 
+// Backend health ping — update status pill
+// FIX: reads data.docs_indexed (was data.docs_indexed — now fixed in backend)
 fetch(`${BACKEND_URL}/`)
   .then(r => r.json())
-  .then(data => console.log(`✅ Backend connected. Chunks indexed: ${data.chunks_indexed}`))
-  .catch(() => console.warn('⚠️ Backend not reachable at', BACKEND_URL));
+  .then(data => {
+    const count = data.docs_indexed || data.chunks_indexed || 0;
+    const label = document.getElementById('statusLabel');
+    if (label) label.textContent = `${count} docs`;
+    console.log(`✅ Backend connected. Chunks indexed: ${count}`);
+  })
+  .catch(() => {
+    const pill = document.getElementById('statusPill');
+    if (pill) {
+      pill.classList.add('offline');
+      const label = document.getElementById('statusLabel');
+      if (label) label.textContent = 'Offline';
+    }
+    console.warn('⚠️ Backend not reachable at', BACKEND_URL);
+  });
+
+// Kick off auth check
+initAuth();

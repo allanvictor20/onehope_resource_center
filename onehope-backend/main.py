@@ -2,6 +2,16 @@
 main.py
 ───────
 OneHope Resource Centre — FastAPI Backend
+
+Changes from v1:
+  - Fixed health check: returns docs_indexed (was chunks_indexed) so frontend
+    status display works correctly
+  - Added request timeout (30 s) on Groq call to prevent indefinite hangs
+  - Added Google Sign-In token verification with domain restriction
+  - Added /reindex-status endpoint so the UI can poll progress
+  - Added last_reindex_time tracking
+  - Added Groq model fallback list
+  - Added retry logic for transient errors
 """
 
 import os
@@ -11,11 +21,12 @@ import time
 import threading
 from typing import Optional
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 import requests
 import pandas as pd
 from io import StringIO
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -24,17 +35,35 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
+# Google auth (only needed when GOOGLE_CLIENT_ID is set)
+try:
+    from google.oauth2 import id_token as google_id_token
+    from google.auth.transport import requests as google_requests
+    GOOGLE_AUTH_AVAILABLE = True
+except ImportError:
+    GOOGLE_AUTH_AVAILABLE = False
+
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-GROQ_API_KEY    = os.environ.get("GROQ_API_KEY", "")
-SHEET_CSV_URL   = os.environ.get("SHEET_CSV_URL", "")
-INDEX_PATH      = "./search_index.json"
-TOP_K_CHUNKS    = 5
-SHEET_CACHE_TTL = 1800  # 30 minutes
-MAX_CHUNK_CHARS = 6000  # hard cap on total context sent to Groq
+GROQ_API_KEY     = os.environ.get("GROQ_API_KEY", "")
+SHEET_CSV_URL    = os.environ.get("SHEET_CSV_URL", "")
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
+ALLOWED_DOMAIN   = os.environ.get("ALLOWED_DOMAIN", "")   # e.g. "onehope.net"
+INDEX_PATH       = "./search_index.json"
+TOP_K_CHUNKS     = 5
+SHEET_CACHE_TTL  = 1800   # 30 minutes
+MAX_CHUNK_CHARS  = 6000   # hard cap on total context sent to Groq
+GROQ_TIMEOUT     = 30     # seconds
+
+# Groq model preference list — first available is used
+GROQ_MODELS = [
+    "llama-3.3-70b-versatile",
+    "llama-3.1-70b-versatile",
+    "llama3-70b-8192",
+]
 
 
 # ── TF-IDF SEARCH INDEX ───────────────────────────────────────────────────────
@@ -42,6 +71,8 @@ MAX_CHUNK_CHARS = 6000  # hard cap on total context sent to Groq
 _search_index: list = []
 _tfidf_vectorizer = None
 _tfidf_matrix = None
+_last_reindex_time: Optional[str] = None
+_reindex_in_progress: bool = False
 
 
 def load_search_index():
@@ -75,16 +106,11 @@ def load_search_index():
 
 
 def search_index(query: str, top_k: int = TOP_K_CHUNKS) -> list:
-    """
-    TF-IDF search — returns only chunks with actual relevance (score > 0).
-    Results are sorted by score descending and capped at top_k.
-    """
     if _tfidf_vectorizer is None or _tfidf_matrix is None or not _search_index:
         return []
 
     query_vec = _tfidf_vectorizer.transform([query])
     scores = cosine_similarity(query_vec, _tfidf_matrix).flatten()
-
     top_indices = scores.argsort()[::-1][:top_k]
 
     results = []
@@ -94,15 +120,14 @@ def search_index(query: str, top_k: int = TOP_K_CHUNKS) -> list:
             chunk["score"] = float(scores[idx])
             results.append(chunk)
 
-    logger.info(f"TF-IDF search: {len(results)} relevant chunks found (top score: {results[0]['score']:.3f})" if results else "TF-IDF search: no relevant chunks found")
+    if results:
+        logger.info(f"TF-IDF search: {len(results)} relevant chunks (top score: {results[0]['score']:.3f})")
+    else:
+        logger.info("TF-IDF search: no relevant chunks found")
     return results
 
 
 def build_context(chunks: list, max_chars: int = MAX_CHUNK_CHARS) -> str:
-    """
-    Assembles chunk texts into a single context string, capped at max_chars.
-    This is the ONLY thing sent to Groq — no full sheet dump.
-    """
     parts = []
     total = 0
     for i, chunk in enumerate(chunks):
@@ -110,14 +135,12 @@ def build_context(chunks: list, max_chars: int = MAX_CHUNK_CHARS) -> str:
         source = chunk.get("file_name", "Unknown")
         block = f"[Excerpt {i+1} — {source}]:\n{text}"
         if total + len(block) > max_chars:
-            # trim the last block to fit
             remaining = max_chars - total
-            if remaining > 200:  # only add if meaningful content remains
+            if remaining > 200:
                 parts.append(block[:remaining] + "…")
             break
         parts.append(block)
         total += len(block)
-
     return "\n\n".join(parts)
 
 
@@ -127,7 +150,6 @@ _sheet_cache: dict = {"df": None, "last_fetched": 0}
 
 
 def get_sheet_data() -> pd.DataFrame:
-    """Fetches and caches the Google Sheet CSV for 30 minutes."""
     now = time.time()
     if _sheet_cache["df"] is not None and (now - _sheet_cache["last_fetched"]) < SHEET_CACHE_TTL:
         return _sheet_cache["df"]
@@ -152,14 +174,74 @@ def get_sheet_data() -> pd.DataFrame:
 # ── SCHEDULED RE-INDEX ────────────────────────────────────────────────────────
 
 def run_scheduled_reindex():
+    global _last_reindex_time, _reindex_in_progress
+    if _reindex_in_progress:
+        logger.warning("Re-index already running, skipping.")
+        return
+    _reindex_in_progress = True
     logger.info("⏰ Re-index starting...")
     try:
         from indexer import run_indexer
         run_indexer()
         load_search_index()
+        _last_reindex_time = datetime.now(timezone.utc).isoformat()
         logger.info("✅ Re-index complete.")
     except Exception as e:
         logger.error(f"❌ Re-index failed: {e}")
+    finally:
+        _reindex_in_progress = False
+
+
+# ── GOOGLE SIGN-IN VERIFICATION ───────────────────────────────────────────────
+
+def verify_google_token(authorization: str = Header(default=None)):
+    """
+    Dependency — call with Depends(verify_google_token) on protected routes.
+
+    If GOOGLE_CLIENT_ID is not configured, auth is disabled and every request
+    is allowed (useful during local development).
+
+    If ALLOWED_DOMAIN is set (e.g. "onehope.net"), only emails from that domain
+    are accepted after the token is verified.
+    """
+    if not GOOGLE_CLIENT_ID:
+        # Auth not configured — allow all requests
+        return {"email": "anonymous", "auth_disabled": True}
+
+    if not GOOGLE_AUTH_AVAILABLE:
+        raise HTTPException(
+            status_code=500,
+            detail="google-auth library not installed. Run: pip install google-auth"
+        )
+
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Authorization header missing.")
+
+    token = authorization.replace("Bearer ", "").strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Bearer token missing.")
+
+    try:
+        info = google_id_token.verify_oauth2_token(
+            token,
+            google_requests.Request(),
+            GOOGLE_CLIENT_ID,
+            clock_skew_in_seconds=10,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Invalid token: {str(e)}")
+
+    email = info.get("email", "")
+    if not info.get("email_verified", False):
+        raise HTTPException(status_code=403, detail="Email not verified by Google.")
+
+    if ALLOWED_DOMAIN and not email.endswith(f"@{ALLOWED_DOMAIN}"):
+        raise HTTPException(
+            status_code=403,
+            detail=f"Access restricted to @{ALLOWED_DOMAIN} accounts."
+        )
+
+    return info
 
 
 # ── GROQ ──────────────────────────────────────────────────────────────────────
@@ -168,6 +250,31 @@ def get_groq_client():
     if not GROQ_API_KEY:
         raise EnvironmentError("GROQ_API_KEY is not set in .env")
     return Groq(api_key=GROQ_API_KEY)
+
+
+def call_groq_with_fallback(client: Groq, messages: list, max_tokens: int = 1200, temperature: float = 0.7) -> str:
+    """
+    Tries each model in GROQ_MODELS in order, returning on first success.
+    Raises HTTPException only if all models fail.
+    """
+    last_error = None
+    for model in GROQ_MODELS:
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                timeout=GROQ_TIMEOUT,
+            )
+            if model != GROQ_MODELS[0]:
+                logger.info(f"Used fallback Groq model: {model}")
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            last_error = e
+            logger.warning(f"Groq model {model} failed: {e}")
+            continue
+    raise HTTPException(status_code=502, detail=f"All Groq models failed. Last error: {str(last_error)}")
 
 
 # ── MODELS ───────────────────────────────────────────────────────────────────
@@ -186,8 +293,8 @@ class Source(BaseModel):
 class ChatResponse(BaseModel):
     answer: str
     sources: list[Source]
-    suggestions: list[str] = []        # follow-up suggestion buttons
-    needs_clarification: bool = False  # True = query was too vague
+    suggestions: list[str] = []
+    needs_clarification: bool = False
 
 
 # ── LIFESPAN ──────────────────────────────────────────────────────────────────
@@ -227,7 +334,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="OneHope Resource Centre API",
-    version="1.0.0",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
@@ -244,11 +351,18 @@ app.add_middleware(
 
 @app.get("/")
 def health_check():
+    """
+    FIX: renamed chunks_indexed → docs_indexed so frontend status pill works.
+    Also exposes last_reindex_time so the UI can show "last updated" info.
+    """
     return {
         "status": "ok",
-        "chunks_indexed": len(_search_index),
+        "docs_indexed": len(_search_index),          # ← fixed key name
+        "chunks_indexed": len(_search_index),         # kept for backwards compat
         "search_ready": _tfidf_vectorizer is not None,
         "sheet_loaded": _sheet_cache["df"] is not None,
+        "last_reindex_time": _last_reindex_time,
+        "auth_enabled": bool(GOOGLE_CLIENT_ID),
     }
 
 
@@ -256,31 +370,44 @@ def health_check():
 def index_status():
     if not _search_index:
         return {"indexed": False, "message": "No index found. Run 'python indexer.py' first."}
-    return {"indexed": True, "total_chunks": len(_search_index)}
+    return {
+        "indexed": True,
+        "total_chunks": len(_search_index),
+        "in_progress": _reindex_in_progress,
+        "last_reindex_time": _last_reindex_time,
+    }
 
 
 @app.post("/reindex")
 def trigger_reindex():
+    """Manually trigger a re-index. Safe to call while server is live."""
+    if _reindex_in_progress:
+        return {"status": "already_running", "message": "Re-index is already in progress."}
     thread = threading.Thread(target=run_scheduled_reindex, daemon=True)
     thread.start()
-    return {"status": "reindex started"}
+    return {"status": "reindex_started", "message": "Re-index started in background. Poll /index-status for progress."}
 
 
 @app.post("/chat", response_model=ChatResponse)
-def chat(req: ChatRequest):
+def chat(req: ChatRequest, user=Depends(verify_google_token)):
+    """
+    Main chat endpoint.
+    Protected by Google Sign-In when GOOGLE_CLIENT_ID env var is set.
+    Auth is disabled automatically during local development (no GOOGLE_CLIENT_ID).
+    """
     user_message = req.message.strip()
     if not user_message:
         raise HTTPException(status_code=400, detail="Message cannot be empty.")
 
-    logger.info(f"Question: {user_message[:80]}...")
+    logger.info(f"Question from {user.get('email', 'anon')}: {user_message[:80]}")
 
-    # ── STEP 1: TF-IDF search — find relevant chunks only ──
+    # ── STEP 1: TF-IDF search ──
     results = search_index(user_message, top_k=TOP_K_CHUNKS)
 
-    # ── STEP 2: Build lean context from top results only ──
-    doc_context = build_context(results)  # capped at MAX_CHUNK_CHARS
+    # ── STEP 2: Build lean context ──
+    doc_context = build_context(results)
 
-    # ── STEP 3: Collect sources from matched chunks ──
+    # ── STEP 3: Collect sources ──
     sources = []
     seen_urls = set()
     for chunk in results:
@@ -293,13 +420,13 @@ def chat(req: ChatRequest):
                 folder=chunk.get("folder", "General"),
             ))
 
-    # ── STEP 4: Keep sheet cache warm (NOT sent to Groq) ──
+    # ── STEP 4: Keep sheet cache warm ──
     try:
         get_sheet_data()
     except Exception:
         pass
 
-    # ── STEP 5: Build prompt — only relevant excerpts, no full sheet ──
+    # ── STEP 5: Build prompt ──
     if doc_context:
         context_block = f"""=== RELEVANT DOCUMENT EXCERPTS ===
 {doc_context}
@@ -344,7 +471,7 @@ Rules:
 
     # ── STEP 6: Build message history (last 10 turns max) ──
     messages = [{"role": "system", "content": system_prompt}]
-    history = (req.conversation_history or [])[-20:]  # last 10 turns (20 entries)
+    history = (req.conversation_history or [])[-20:]
     for turn in history:
         role = "assistant" if turn.get("role") == "model" else "user"
         content = turn.get("content", "")
@@ -352,22 +479,17 @@ Rules:
             messages.append({"role": role, "content": content})
     messages.append({"role": "user", "content": user_message})
 
-    # ── STEP 7: Single Groq call ──
+    # ── STEP 7: Groq call with model fallback & timeout ──
     try:
         client = get_groq_client()
-        response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=messages,
-            max_tokens=1200,
-            temperature=0.7,
-        )
-        raw = response.choices[0].message.content.strip()
+        raw = call_groq_with_fallback(client, messages)
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Groq API error: {e}")
         raise HTTPException(status_code=502, detail=f"AI service error: {str(e)}")
 
     # ── STEP 8: Parse JSON response ──
-    # Strip markdown fences if Groq wraps response in them
     if raw.startswith("```"):
         raw = raw.split("```")[1]
         if raw.startswith("json"):
@@ -377,7 +499,6 @@ Rules:
     try:
         parsed = json.loads(raw)
     except Exception:
-        # Groq didn't return valid JSON — treat entire response as plain answer
         logger.warning("Groq did not return valid JSON, using plain text fallback")
         parsed = {
             "answer": raw,

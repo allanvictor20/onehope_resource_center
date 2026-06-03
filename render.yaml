@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: onehope-resource-centre
+    runtime: python
+    rootDir: onehope-backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false        # you set this in Render dashboard
+      - key: SHEET_CSV_URL
+        sync: false
+      - key: GOOGLE_SERVICE_ACCOUNT_JSON
+        sync: false
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: ALLOWED_DOMAIN
+        sync: false
