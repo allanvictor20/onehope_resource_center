@@ -3,7 +3,7 @@
 service_account.json
 
 # Search index (regenerate with indexer.py)
-search_index.json
+#search_index.json
 
 # Python
 __pycache__/
