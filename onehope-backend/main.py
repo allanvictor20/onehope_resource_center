@@ -2,16 +2,6 @@
 main.py
 ───────
 OneHope Resource Centre — FastAPI Backend
-
-Changes from v1:
-  - Fixed health check: returns docs_indexed (was chunks_indexed) so frontend
-    status display works correctly
-  - Added request timeout (30 s) on Groq call to prevent indefinite hangs
-  - Added Google Sign-In token verification with domain restriction
-  - Added /reindex-status endpoint so the UI can poll progress
-  - Added last_reindex_time tracking
-  - Added Groq model fallback list
-  - Added retry logic for transient errors
 """
 
 import os
@@ -35,7 +25,6 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
-# Google auth (only needed when GOOGLE_CLIENT_ID is set)
 try:
     from google.oauth2 import id_token as google_id_token
     from google.auth.transport import requests as google_requests
@@ -51,20 +40,20 @@ logger = logging.getLogger(__name__)
 GROQ_API_KEY     = os.environ.get("GROQ_API_KEY", "")
 SHEET_CSV_URL    = os.environ.get("SHEET_CSV_URL", "")
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
-ALLOWED_DOMAIN   = os.environ.get("ALLOWED_DOMAIN", "")   # e.g. "onehope.net"
+ALLOWED_DOMAIN   = os.environ.get("ALLOWED_DOMAIN", "")
 INDEX_PATH       = "./search_index.json"
 TOP_K_CHUNKS     = 5
-SHEET_CACHE_TTL  = 1800   # 30 minutes
-MAX_CHUNK_CHARS  = 6000   # hard cap on total context sent to Groq
-GROQ_TIMEOUT     = 30     # seconds
+SHEET_CACHE_TTL  = 1800
+MAX_CHUNK_CHARS  = 6000
+GROQ_TIMEOUT     = 30
 
-# Groq model preference list — first available is used
 GROQ_MODELS = [
-    "llama-3.3-70b-versatile",  # Primary heavy-lifter (128k context)
-    "openai/gpt-oss-120b",      # Exceptional fallback for deep reasoning tasks
-    "qwen/qwen3-32b",           # High-speed mid-weight fallback (replaces Mixtral)
-    "llama-4-scout",            # Extremely fast, highly optimized safety net
+    "llama-3.3-70b-versatile",
+    "openai/gpt-oss-120b",
+    "qwen/qwen3-32b",
+    "llama-4-scout",
 ]
+
 # ── TF-IDF SEARCH INDEX ───────────────────────────────────────────────────────
 
 _search_index: list = []
@@ -194,24 +183,11 @@ def run_scheduled_reindex():
 # ── GOOGLE SIGN-IN VERIFICATION ───────────────────────────────────────────────
 
 def verify_google_token(authorization: str = Header(default=None)):
-    """
-    Dependency — call with Depends(verify_google_token) on protected routes.
-
-    If GOOGLE_CLIENT_ID is not configured, auth is disabled and every request
-    is allowed (useful during local development).
-
-    If ALLOWED_DOMAIN is set (e.g. "onehope.net"), only emails from that domain
-    are accepted after the token is verified.
-    """
     if not GOOGLE_CLIENT_ID:
-        # Auth not configured — allow all requests
         return {"email": "anonymous", "auth_disabled": True}
 
     if not GOOGLE_AUTH_AVAILABLE:
-        raise HTTPException(
-            status_code=500,
-            detail="google-auth library not installed. Run: pip install google-auth"
-        )
+        raise HTTPException(status_code=500, detail="google-auth library not installed.")
 
     if not authorization:
         raise HTTPException(status_code=401, detail="Authorization header missing.")
@@ -235,10 +211,7 @@ def verify_google_token(authorization: str = Header(default=None)):
         raise HTTPException(status_code=403, detail="Email not verified by Google.")
 
     if ALLOWED_DOMAIN and not email.endswith(f"@{ALLOWED_DOMAIN}"):
-        raise HTTPException(
-            status_code=403,
-            detail=f"Access restricted to @{ALLOWED_DOMAIN} accounts."
-        )
+        raise HTTPException(status_code=403, detail=f"Access restricted to @{ALLOWED_DOMAIN} accounts.")
 
     return info
 
@@ -252,10 +225,6 @@ def get_groq_client():
 
 
 def call_groq_with_fallback(client: Groq, messages: list, max_tokens: int = 1200, temperature: float = 0.7) -> str:
-    """
-    Tries each model in GROQ_MODELS in order, returning on first success.
-    Raises HTTPException only if all models fail.
-    """
     last_error = None
     for model in GROQ_MODELS:
         try:
@@ -274,6 +243,40 @@ def call_groq_with_fallback(client: Groq, messages: list, max_tokens: int = 1200
             logger.warning(f"Groq model {model} failed: {e}")
             continue
     raise HTTPException(status_code=502, detail=f"All Groq models failed. Last error: {str(last_error)}")
+
+
+def extract_json(raw: str) -> dict:
+    """
+    Robustly extract a JSON object from the model's raw output,
+    regardless of whether it has markdown fences, prose before/after,
+    or other junk around the JSON.
+    """
+    raw = raw.strip()
+
+    # Remove markdown fences if present
+    if raw.startswith("```"):
+        raw = raw.split("\n", 1)[1] if "\n" in raw else raw[3:]
+    if raw.endswith("```"):
+        raw = raw.rsplit("```", 1)[0]
+    raw = raw.strip()
+
+    # Find the outermost { ... } and extract just that
+    brace_start = raw.find("{")
+    brace_end = raw.rfind("}")
+    if brace_start != -1 and brace_end != -1 and brace_end > brace_start:
+        raw = raw[brace_start:brace_end + 1]
+
+    try:
+        return json.loads(raw)
+    except Exception:
+        logger.warning("Could not parse JSON from model output, using plain text fallback")
+        return {
+            "answer": raw,
+            "needs_clarification": False,
+            "suggestions": [],
+            "clarification_question": "",
+            "clarification_options": [],
+        }
 
 
 # ── MODELS ───────────────────────────────────────────────────────────────────
@@ -331,11 +334,7 @@ async def lifespan(app: FastAPI):
 
 # ── APP ───────────────────────────────────────────────────────────────────────
 
-app = FastAPI(
-    title="OneHope Resource Centre API",
-    version="2.0.0",
-    lifespan=lifespan,
-)
+app = FastAPI(title="OneHope Resource Centre API", version="2.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -375,7 +374,6 @@ def index_status():
 
 @app.post("/reindex")
 def trigger_reindex():
-    """Manually trigger a re-index. Safe to call while server is live."""
     if _reindex_in_progress:
         return {"status": "already_running", "message": "Re-index is already in progress."}
     thread = threading.Thread(target=run_scheduled_reindex, daemon=True)
@@ -452,9 +450,14 @@ OneHope works to provide every child with God's Word and help them make a decisi
 9. Handle typos, abbreviations, and informal English gracefully. If a word is slightly misspelled (e.g. "sparck" instead of "spark"), figure out what was meant and answer accordingly. Never refuse to answer just because of a spelling variation.
 10. Be consistent in style and tone every time, regardless of which AI model is running in the background.
 
-=== RESPONSE FORMAT ===
+=== RESPONSE FORMAT — CRITICAL ===
 
-You MUST respond with a JSON object only. No markdown fences, no preamble, just raw JSON.
+You MUST respond with a JSON object and NOTHING ELSE.
+- No prose before the JSON.
+- No explanation after the JSON.
+- No markdown fences (no ```json).
+- Just the raw JSON object, starting with {{ and ending with }}.
+
 Use this exact structure:
 {{
   "needs_clarification": false,
@@ -467,10 +470,10 @@ Use this exact structure:
 Rules:
 - If the query is too vague to answer meaningfully (e.g. just "training" or "resources" with no context), set needs_clarification to true, write a short clarification_question, and provide 3-4 short clarification_options as button labels. Leave answer empty.
 - If the query is clear enough, set needs_clarification to false, leave clarification fields empty, write the full answer, and provide 3 short follow-up suggestions (max 8 words each).
-- Never return anything outside the JSON object.
+- Your entire response must be the JSON object. If you write anything before or after it, the app will break.
 """
 
-    # ── STEP 6: Build message history (last 10 turns max) ──
+    # ── STEP 6: Build message history (last 20 turns max) ──
     messages = [{"role": "system", "content": system_prompt}]
     history = (req.conversation_history or [])[-20:]
     for turn in history:
@@ -490,24 +493,8 @@ Rules:
         logger.error(f"Groq API error: {e}")
         raise HTTPException(status_code=502, detail=f"AI service error: {str(e)}")
 
-    # ── STEP 8: Parse JSON response ──
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-    raw = raw.strip()
-
-    try:
-        parsed = json.loads(raw)
-    except Exception:
-        logger.warning("Groq did not return valid JSON, using plain text fallback")
-        parsed = {
-            "answer": raw,
-            "needs_clarification": False,
-            "suggestions": [],
-            "clarification_question": "",
-            "clarification_options": [],
-        }
+    # ── STEP 8: Robustly parse JSON — handles prose before/after and markdown fences ──
+    parsed = extract_json(raw)
 
     needs_clarification = parsed.get("needs_clarification", False)
 
