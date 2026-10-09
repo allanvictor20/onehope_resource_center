@@ -42,12 +42,14 @@ Open `onehope-frontend/index.html` in your browser.
    - `GROQ_API_KEY`
    - `SHEET_CSV_URL`
    - `GOOGLE_SERVICE_ACCOUNT_JSON`
-   - `GOOGLE_CLIENT_ID` (optional — leave blank to disable auth)
+   - `GOOGLE_CLIENT_ID` (required — without it the API refuses requests)
    - `ALLOWED_DOMAIN` (optional — e.g. `onehope.net`)
+   - `ADMIN_EMAILS` (comma-separated — who can use **Refresh Index**)
+   - `ALLOWED_ORIGINS` (your Netlify URL, e.g. `https://onehope-resources.netlify.app`)
 7. Deploy. Copy the URL (e.g. `https://onehope-xxx.onrender.com`).
 
 > ⚠️ **search_index.json on Render**: Render's free tier has an ephemeral filesystem — it resets on every deploy. You have two options:
-> - **Option A (easiest)**: Run `python indexer.py` locally, commit `search_index.json` to your repo, and let Render deploy it.
+> - **Option A (easiest)**: Run `python indexer.py` locally, commit `search_index.json` to your repo, and let Render deploy it. **The repo must be private** — the index contains the full text of internal documents.
 > - **Option B**: Use a free [Supabase Storage](https://supabase.com) bucket and update `INDEX_PATH` in main.py and indexer.py to read/write from the bucket URL.
 
 ---
@@ -81,7 +83,7 @@ Open `onehope-frontend/index.html` in your browser.
 9. In Render dashboard: set `GOOGLE_CLIENT_ID` to the same value.
 10. Optionally set `ALLOWED_DOMAIN=onehope.net` to restrict sign-in to your org.
 
-> 💡 If you leave `GOOGLE_CLIENT_ID` blank in both the frontend and backend `.env`, auth is fully disabled and the app works without sign-in — great for internal local use.
+> 💡 For local development without sign-in, leave `GOOGLE_CLIENT_ID` blank in the frontend and set `AUTH_DISABLED=true` in the backend `.env`. A blank `GOOGLE_CLIENT_ID` on its own no longer disables auth — the server refuses requests instead, so a missing setting in production can't open the API to the public.
 
 ---
 
@@ -90,8 +92,7 @@ Open `onehope-frontend/index.html` in your browser.
 | Method | Command |
 |--------|---------|
 | Direct (recommended) | `cd onehope-backend && python indexer.py` |
-| HTTP (server running) | `curl -X POST http://localhost:8000/reindex` |
-| UI button | Click **Refresh Index** in the sidebar |
+| UI button (admins only) | Click **Refresh Index** in the sidebar |
 | Automatic | Every night at 2:00 AM server time |
 
 Poll progress: `GET /index-status` → `{ "in_progress": true/false, "total_chunks": N }`

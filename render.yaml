@@ -16,3 +16,7 @@ services:
         sync: false
       - key: ALLOWED_DOMAIN
         sync: false
+      - key: ADMIN_EMAILS
+        sync: false
+      - key: ALLOWED_ORIGINS
+        sync: false
