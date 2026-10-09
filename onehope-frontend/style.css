@@ -337,6 +337,9 @@ body {
 .msg-ai-bubble p { margin-bottom: 8px; }
 .msg-ai-bubble p:last-child { margin-bottom: 0; }
 .msg-ai-bubble strong { font-weight: 600; color: var(--navy); }
+.msg-ai-bubble ul, .msg-ai-bubble ol { margin: 0 0 8px 1.25rem; padding: 0; }
+.msg-ai-bubble li { margin-bottom: 4px; }
+.msg-ai-bubble li:last-child { margin-bottom: 0; }
 
 /* Source pills */
 .source-pills { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
