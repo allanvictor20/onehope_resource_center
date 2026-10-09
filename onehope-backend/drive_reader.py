@@ -57,7 +57,9 @@ SKIP_TYPES = {
     "application/octet-stream",
 }
 
-MAX_CHARS_PER_DOC = 6000
+# Upper bound on text kept per document. This used to be 6,000 characters,
+# which meant only the first 2–3 pages of every manual were searchable.
+MAX_CHARS_PER_DOC = int(os.environ.get("MAX_CHARS_PER_DOC", "400000"))
 MAX_RETRIES = 3
 RETRY_BACKOFF = 2  # seconds; doubles each retry
 

@@ -16,3 +16,7 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
+
+# Indexer temp file / test cache
+search_index.json.tmp
+.pytest_cache/
