@@ -205,11 +205,11 @@ async function triggerReindex() {
     const data = await res.json().catch(() => ({}));
 
     if (!res.ok) {
-      label.textContent = res.status === 403 ? 'Admins only' : 'Refresh failed';
+      label.textContent = res.status === 403 ? 'Admins only' : 'Sync failed';
     } else if (data.status === 'already_running') {
       label.textContent = 'Already running…';
     } else {
-      label.textContent = 'Refresh started!';
+      label.textContent = 'Syncing…';
       // Poll index-status until done
       _pollReindexStatus();
     }
@@ -219,7 +219,7 @@ async function triggerReindex() {
 
   setTimeout(() => {
     btn.disabled = false;
-    label.textContent = 'Refresh Index';
+    label.textContent = 'Sync from Drive';
   }, 5000);
 }
 
@@ -233,7 +233,7 @@ function _pollReindexStatus() {
         clearInterval(interval);
         const label = document.getElementById('statusLabel');
         if (label) label.textContent = `${data.total_docs} docs`;
-        console.log('✅ Re-index complete.');
+        console.log('✅ Drive sync complete.');
       }
     } catch {
       clearInterval(interval);
