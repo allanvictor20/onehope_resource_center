@@ -159,6 +159,22 @@ class DocStore:
         with self.engine.connect() as conn:
             return [dict(r._mapping) for r in conn.execute(select(*cols).order_by(documents.c.name))]
 
+    def iter_documents(self, batch: int = 20):
+        """Yields stored files one at a time (with text), so the whole library
+        never has to be in memory at once."""
+        cols = [documents.c.file_id, documents.c.name, documents.c.folder, documents.c.drive_url,
+                documents.c.mime_type, documents.c.status]
+        with self.engine.connect() as conn:
+            ids = [r.file_id for r in conn.execute(select(documents.c.file_id).order_by(documents.c.name))]
+        for i in range(0, len(ids), batch):
+            part = ids[i:i + batch]
+            with self.engine.connect() as conn:
+                rows = conn.execute(select(*cols, documents.c.text)
+                                    .where(documents.c.file_id.in_(part)).order_by(documents.c.name))
+                found = [dict(r._mapping) for r in rows]
+            yield from found
+            del found
+
     def counts(self) -> dict:
         with self.engine.connect() as conn:
             rows = conn.execute(select(documents.c.status, func.count()).group_by(documents.c.status))
