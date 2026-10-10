@@ -186,6 +186,59 @@ def test_quiet_sync_never_touches_the_database(store, drive, monkeypatch):
     assert queries
 
 
+def test_file_that_crashed_the_server_is_skipped_after_restart(store, drive, monkeypatch):
+    """Simulates the server dying (out of memory) while reading a file."""
+    drive.add("ok", "Fine.pdf", text=LONG)
+    drive.add("huge", "Huge deck.pptx", text=LONG)
+    sync(store, drive)
+    drive.add("huge", "Huge deck.pptx", modified="2026-03-01T00:00:00Z", text=LONG)
+
+    def die_on_huge(file_id, *a):
+        if file_id == "huge":
+            raise SystemExit("killed")          # like the OS killing the process
+        return LONG
+    monkeypatch.setattr(drive_sync, "extract_text", die_on_huge)
+    monkeypatch.setattr(drive_sync, "_crash_checked", False)
+    marker_written = []
+    real_set = store.set_state
+    monkeypatch.setattr(store, "set_state",
+                        lambda k, v: marker_written.append(v) if v else None)   # the finally can't clear it
+    with pytest.raises(SystemExit):
+        sync(store, drive)
+    monkeypatch.setattr(store, "set_state", real_set)
+    real_set(drive_sync.READING_KEY, marker_written[-1])
+
+    # "Restart": the marker is found, the file is marked and not read again.
+    monkeypatch.setattr(drive_sync, "_crash_checked", False)
+    drive.extract_calls.clear()
+    monkeypatch.setattr(drive_sync, "extract_text", drive.extract)
+    sync(store, drive)
+    snap = store.snapshot()["huge"]
+    assert snap["status"] == TOO_LARGE
+    assert "huge" not in drive.extract_calls
+    assert store.get_state(drive_sync.READING_KEY) is None
+
+    # Editing the file again gives it another chance.
+    drive.add("huge", "Huge deck.pptx", modified="2026-04-01T00:00:00Z", text=LONG)
+    sync(store, drive)
+    assert store.snapshot()["huge"]["status"] == INDEXED
+
+
+def test_marker_is_cleared_after_normal_reads(store, drive):
+    drive.add("a", "A.pdf", text=LONG)
+    drive.add("bad", "Bad.pdf", text=ValueError("corrupt"))
+    sync(store, drive)
+    assert store.get_state(drive_sync.READING_KEY) is None
+
+
+def test_small_files_are_read_before_big_ones(store, drive):
+    drive.add("big", "Big.pdf", size=50_000_000, text=LONG)
+    drive.add("small", "Small.pdf", size=1_000, text=LONG)
+    drive.add("gdoc", "Doc", "application/vnd.google-apps.document", size=None, text=LONG)
+    sync(store, drive)
+    assert drive.extract_calls == ["gdoc", "small", "big"]
+
+
 def test_full_sync_rereads_everything(store, drive):
     drive.add("a", "A.pdf", text=LONG)
     sync(store, drive)

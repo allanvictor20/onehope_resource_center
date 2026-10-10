@@ -26,6 +26,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Callable, Optional
 
 from doc_store import DocStore, INDEXED, MEDIA, UNSUPPORTED, TOO_LARGE, EMPTY, ERROR
+from memutil import release_memory
 from drive_reader import (
     _retry_call, extract_file_id, extract_text, get_drive_service, is_extractable, is_media,
 )
@@ -39,7 +40,11 @@ FILE_FIELDS = "id, name, mimeType, modifiedTime, size, webViewLink, shortcutDeta
 MAX_FILE_MB = float(os.environ.get("MAX_FILE_MB", "60"))
 MIN_TEXT_CHARS = 50
 ERROR_RETRY_HOURS = 6       # failed files are retried at most this often
-REBUILD_EVERY = 20          # refresh search after this many processed files
+REBUILD_EVERY = 25          # refresh search after this many processed files
+READING_KEY = "reading_file"  # crash guard: the file being read right now
+CRASH_MESSAGE = ("The server ran out of memory while reading this file, so it is listed by title only. "
+                 "It will be tried again if the file is changed.")
+_crash_checked = False      # the guard is checked once per server start
 
 
 @dataclass
@@ -199,6 +204,30 @@ def _needs_processing(record: dict, stored: Optional[dict], full: bool) -> bool:
     return False
 
 
+def _skip_file_that_crashed_last_time(store: DocStore, remote: list, stored: dict) -> None:
+    """After a restart, marks the file that was being read when the server
+    died as too large, so it can't crash the server in a loop."""
+    global _crash_checked
+    if _crash_checked:
+        return
+    _crash_checked = True
+    raw = store.get_state(READING_KEY)
+    if not raw:
+        return
+    store.set_state(READING_KEY, None)
+    try:
+        marker = json.loads(raw)
+    except ValueError:
+        return
+    record = next((r for r in remote if r["file_id"] == marker.get("file_id")), None)
+    if record is None or record["modified_time"] != marker.get("modified_time"):
+        return      # deleted or edited since — read it normally
+    logger.warning(f"Skipping {record['name']}: the server stopped while reading it last time "
+                   f"(probably out of memory). It is listed by title only.")
+    store.upsert({**record, "status": TOO_LARGE, "text": None, "error": CRASH_MESSAGE})
+    stored[record["file_id"]] = store.snapshot()[record["file_id"]]
+
+
 def run_sync(store: DocStore, service, list_files: Callable[[], list], source: str = "drive",
              full: bool = False, on_batch: Optional[Callable[[], None]] = None) -> SyncResult:
     result = SyncResult(source=source, started_at=datetime.now(timezone.utc).isoformat())
@@ -220,9 +249,12 @@ def run_sync(store: DocStore, service, list_files: Callable[[], list], source: s
     if result.removed:
         logger.info(f"Removed {result.removed} files no longer in Drive")
 
-    # New files first, so fresh uploads become searchable soonest.
+    _skip_file_that_crashed_last_time(store, remote, stored)
+
+    # New files first, so fresh uploads become searchable soonest; small files
+    # before big ones, so most of the library is ready early.
     todo = [r for r in remote if _needs_processing(r, stored.get(r["file_id"]), full)]
-    todo.sort(key=lambda r: r["file_id"] in stored)
+    todo.sort(key=lambda r: (r["file_id"] in stored, r.get("size_bytes") or 0))
     todo_ids = {r["file_id"] for r in todo}
 
     for r in remote:
@@ -241,8 +273,20 @@ def run_sync(store: DocStore, service, list_files: Callable[[], list], source: s
     for i, record in enumerate(todo, 1):
         is_new = record["file_id"] not in stored
         logger.info(f"[{i}/{len(todo)}] {record['name']}")
-        doc = _process_file(record, service)
-        store.upsert(doc)
+        downloads = is_extractable(record["mime_type"])
+        if downloads:
+            # If the server dies while reading this file (out of memory), the
+            # next start sees this marker and skips the file instead of
+            # crashing on it again and again.
+            store.set_state(READING_KEY, json.dumps(
+                {"file_id": record["file_id"], "modified_time": record["modified_time"], "name": record["name"]}))
+        try:
+            doc = _process_file(record, service)
+            store.upsert(doc)
+        finally:
+            if downloads:
+                store.set_state(READING_KEY, None)
+                release_memory()
         if doc["status"] == ERROR:
             result.failed += 1
         elif is_new:
