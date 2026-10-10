@@ -165,6 +165,18 @@ function _loadCachedAuth() {
 function showApp() {
   document.getElementById('mainApp').style.display = '';
   renderSidebar();
+  _checkAdmin();
+}
+
+// Only administrators can refresh the index, so hide the button for everyone else.
+async function _checkAdmin() {
+  const btn = document.getElementById('reindexBtn');
+  if (!btn) return;
+  btn.style.display = 'none';
+  try {
+    const res = await fetch(`${BACKEND_URL}/me`, { headers: _authHeaders() });
+    if (res.ok && (await res.json()).is_admin) btn.style.display = '';
+  } catch { /* backend offline — keep hidden */ }
 }
 
 // ── AUTH HEADER HELPER ────────────────────────────────────────────────────────
@@ -190,12 +202,14 @@ async function triggerReindex() {
       method: 'POST',
       headers: _authHeaders(),
     });
-    const data = await res.json();
+    const data = await res.json().catch(() => ({}));
 
-    if (data.status === 'already_running') {
+    if (!res.ok) {
+      label.textContent = res.status === 403 ? 'Admins only' : 'Sync failed';
+    } else if (data.status === 'already_running') {
       label.textContent = 'Already running…';
     } else {
-      label.textContent = 'Refresh started!';
+      label.textContent = 'Syncing…';
       // Poll index-status until done
       _pollReindexStatus();
     }
@@ -205,20 +219,21 @@ async function triggerReindex() {
 
   setTimeout(() => {
     btn.disabled = false;
-    label.textContent = 'Refresh Index';
+    label.textContent = 'Sync from Drive';
   }, 5000);
 }
 
 function _pollReindexStatus() {
   const interval = setInterval(async () => {
     try {
-      const res = await fetch(`${BACKEND_URL}/index-status`);
+      const res = await fetch(`${BACKEND_URL}/index-status`, { headers: _authHeaders() });
+      if (!res.ok) { clearInterval(interval); return; }
       const data = await res.json();
       if (!data.in_progress) {
         clearInterval(interval);
         const label = document.getElementById('statusLabel');
-        if (label) label.textContent = `${data.total_chunks} chunks`;
-        console.log('✅ Re-index complete.');
+        if (label) label.textContent = `${data.total_docs} docs`;
+        console.log('✅ Drive sync complete.');
       }
     } catch {
       clearInterval(interval);
@@ -371,18 +386,55 @@ function saveCurrentChat() {
 // ── DOM HELPERS ───────────────────────────────────────────────────────────────
 
 function escapeHtml(str) {
-  return String(str)
+  return String(str ?? '')
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+// Only allow real web links in source buttons (blocks javascript: URLs etc.)
+function safeUrl(url) {
+  try {
+    const u = new URL(url);
+    return (u.protocol === 'https:' || u.protocol === 'http:') ? u.href : '#';
+  } catch {
+    return '#';
+  }
+}
+
+// Model output is escaped FIRST, then a small markdown subset is applied,
+// so any HTML in an answer is shown as text instead of being executed.
+function _inlineMarkdown(line) {
+  return line
+    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+    .replace(/(^|[^*])\*(?!\s)([^*]+?)\*(?!\*)/g, '$1<em>$2</em>');
 }
 
 function formatText(text) {
   if (!text) return '';
-  let result = text.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
-  result = result.replace(/\*(.*?)\*/g, '<em>$1</em>');
-  result = result.split('\n').map(line => line.trim() ? `<p>${line}</p>` : '').join('');
-  return result || `<p>${text}</p>`;
+  const lines = escapeHtml(text).split('\n');
+  let html = '';
+  let listType = null;
+
+  const closeList = () => { if (listType) { html += `</${listType}>`; listType = null; } };
+
+  for (const raw of lines) {
+    const line = raw.trim();
+    const bullet = line.match(/^[-•*]\s+(.*)$/);
+    const numbered = line.match(/^\d+[.)]\s+(.*)$/);
+    if (bullet || numbered) {
+      const type = bullet ? 'ul' : 'ol';
+      if (listType !== type) { closeList(); html += `<${type}>`; listType = type; }
+      html += `<li>${_inlineMarkdown((bullet || numbered)[1])}</li>`;
+    } else {
+      closeList();
+      if (line) html += `<p>${_inlineMarkdown(line)}</p>`;
+    }
+  }
+  closeList();
+  return html;
 }
 
 function scrollToBottom() {
@@ -411,7 +463,7 @@ function appendAiBubble(text, sources, suggestions, needsClarification) {
   if (!needsClarification && sources && sources.length > 0) {
     sourcesHTML = '<div class="source-pills">';
     sources.forEach(src => {
-      sourcesHTML += `<a href="${src.drive_url}" target="_blank" rel="noopener" class="source-pill">
+      sourcesHTML += `<a href="${escapeHtml(safeUrl(src.drive_url))}" target="_blank" rel="noopener noreferrer" class="source-pill">
         <svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6zm4 18H6V4h7v5h5v11z"/></svg>
         ${escapeHtml(src.file_name)}
       </a>`;
@@ -531,13 +583,17 @@ async function sendMessage() {
       })
     });
 
-    const data = await response.json();
+    const data = await response.json().catch(() => ({}));
     removeTypingIndicator();
 
-    if (response.status === 401 || response.status === 403) {
+    if (response.status === 401) {
       // Token expired — prompt re-sign-in
       localStorage.removeItem('onehope_auth');
       appendErrorBubble('Your session has expired. Please refresh the page and sign in again.');
+    } else if (response.status === 403) {
+      appendErrorBubble(data.detail || 'Your account does not have access to the Resource Centre.');
+    } else if (response.status === 429) {
+      appendErrorBubble(data.detail || "You're sending messages too quickly. Please wait a moment.");
     } else if (!response.ok) {
       appendErrorBubble(data.detail || 'An error occurred on the server.');
     } else {
@@ -583,7 +639,6 @@ document.getElementById('userInput').addEventListener('keydown', function (e) {
 // ── INIT ──────────────────────────────────────────────────────────────────────
 
 // Backend health ping — update status pill
-// FIX: reads data.docs_indexed (was data.docs_indexed — now fixed in backend)
 fetch(`${BACKEND_URL}/`)
   .then(r => r.json())
   .then(data => {

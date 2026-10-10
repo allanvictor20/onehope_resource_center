@@ -1,177 +1,147 @@
-# OneHope Resource Centre — Backend
+# OneHope Resource Centre
 
-AI-powered resource assistant for OneHope Uganda.  
-Built with FastAPI (Python) + search index + Google Drive API + Gemini.
+AI-powered resource assistant for OneHope Uganda.
+Built with FastAPI (Python), Google Drive, a Postgres document store, TF-IDF search and Groq-hosted LLMs.
+
+**Adding a resource = putting the file in the OneHope Drive folder.** Within about ten
+minutes the assistant can answer questions from it. Edits and deletions are picked up
+the same way. Nobody runs an indexer or commits anything.
 
 ---
 
 ## How it works
 
 ```
-User message (HTML frontend)
-        ↓
-POST /chat  (FastAPI backend)
-        ↓
-search index vector search → top 5 relevant document chunks  [FREE, no API call]
-        ↓
-Google Sheet summary fetched (cached 30 min)             [FREE, no API call]
-        ↓
-Gemini API called with question + chunks + sheet index   [1 API call]
-        ↓
-Answer + source links returned to frontend
+                 every 10 min (and on startup)
+Google Drive folder ──────────────────────────────► Drive sync
+  (+ subfolders)       list files (cheap, no downloads)   │
+                       read only new / changed files       │ store text + metadata
+                       drop deleted files                  ▼
+                                                     Postgres (Neon / Supabase)
+                                                           │ rebuilt in memory
+                                                           ▼ when something changes
+User question ──► POST /chat ──► search passages + catalogue ──► Groq LLM ──► answer + source links
 ```
 
-**Result: 1 Gemini API call per user message, regardless of library size.**
+- **Sync** (`drive_sync.py`): lists the folder tree; compares it with what's stored;
+  downloads only what changed. When nothing changed it doesn't even touch the database,
+  so a free database can sleep. New uploads are processed first.
+- **Store** (`doc_store.py`): one row per Drive file with its extracted text. Survives
+  restarts and redeploys, so the server is ready again in seconds.
+- **Search** (`search.py`): passages of every document (typo-tolerant), plus a title
+  catalogue of every file — including videos and images, which have no text.
+- **Optional sheet**: if `SHEET_CSV_URL` is set, extra columns from the resource sheet
+  (language, audience…) are attached to matching files to improve search. The sheet is
+  no longer needed for anything to appear.
 
 ---
 
-## Project structure
+## One-time setup
 
-```
-onehope-backend/
-├── main.py                      # FastAPI server (run this to serve requests)
-├── indexer.py                   # One-time script to index all Drive documents
-├── drive_reader.py              # Google Drive file fetcher and text extractor
-├── requirements.txt             # Python dependencies
-├── .env.example                 # Copy to .env and fill in your values
-├── .env                         # Your secrets (NEVER commit to GitHub)
-├── service_account.json         # Downloaded from Google Cloud (NEVER commit)
-├── search_index.json                   # Created by indexer.py (auto-generated)
-└── onehope_assistant_frontend.html  # Updated frontend (talks to this backend)
-```
+### 1. Share the Drive folder with the service account
+Open `GOOGLE_SERVICE_ACCOUNT_JSON` and copy the `client_email`
+(…@….iam.gserviceaccount.com). In Google Drive, **Share** the resources folder with that
+address as **Viewer**. Everything inside it — including subfolders — is then included.
+
+### 2. Copy the folder ID
+Open the folder in the browser. The ID is the last part of the URL:
+`https://drive.google.com/drive/folders/`**`1AbCdEfGhIjK…`** → set `DRIVE_FOLDER_ID` to it.
+
+### 3. Create a free Postgres database
+**[Neon](https://neon.com)** (recommended): sign up → create a project → copy the
+connection string (`postgresql://…neon.tech/neondb?sslmode=require`) → set it as
+`DATABASE_URL`. The app creates its tables itself.
+
+> Supabase works too: use the **Session pooler** connection string (Connect → Session pooler),
+> because Render can't reach Supabase's direct IPv6 address.
+
+Without `DATABASE_URL` the app uses a local SQLite file. That's fine on your laptop,
+but on Render's free tier the disk is wiped on every restart, so all documents would be
+re-read from Drive each time.
+
+### 4. Keep the server awake (Render free tier)
+Render's free tier puts the server to sleep after 15 minutes without visitors, and a
+sleeping server can't sync. Create a free job at **[cron-job.org](https://cron-job.org)**
+that requests `https://<your-app>.onrender.com/` every 10 minutes.
+This uses ~744 of the 750 free Render hours a month, so keep other free Render services
+off the same account (or let this one sleep — it then syncs whenever someone opens it).
+
+### 5. Set the environment variables on Render
+See the table below, then deploy. The first sync starts immediately; documents become
+searchable in batches as they're read (the first full load takes a few minutes).
 
 ---
 
-## Setup (step by step)
+## Environment variables
 
-### 1. Clone / download this folder
+| Variable | Required | Purpose |
+|---|---|---|
+| `GROQ_API_KEY` | ✅ | Groq API key |
+| `DRIVE_FOLDER_ID` | ✅ | The Drive folder holding the resources (shared with the service account) |
+| `GOOGLE_SERVICE_ACCOUNT_JSON` | ✅ | Service-account key, as one line of JSON |
+| `DATABASE_URL` | ✅ in production | Postgres connection string (Neon / Supabase) |
+| `GOOGLE_CLIENT_ID` | ✅ in production | OAuth client ID for Google Sign-In. If missing, the API refuses requests |
+| `ADMIN_EMAILS` | recommended | Comma-separated emails that see the **Sync from Drive** button |
+| `ALLOWED_ORIGINS` | recommended | Comma-separated frontend URLs allowed by CORS |
+| `ALLOWED_DOMAIN` | optional | Only allow accounts from this domain, e.g. `onehope.net` |
+| `SHEET_CSV_URL` | optional | Resource sheet CSV, for extra search details (or as the file list if `DRIVE_FOLDER_ID` is unset) |
+| `SYNC_INTERVAL_MINUTES` | optional | How often to check Drive (default 10) |
+| `MAX_FILE_MB` | optional | Skip files larger than this (default 60) |
+| `RATE_LIMIT_PER_MINUTE` | optional | Messages per user per minute (default 10, `0` disables) |
+| `GROQ_MODELS` | optional | Comma-separated model fallback order |
+| `AUTH_DISABLED` | local dev only | `true` skips sign-in entirely |
+
+---
+
+## Local development
 
 ```bash
 cd onehope-backend
-```
-
-### 2. Create and activate a virtual environment
-
-```bash
 python -m venv venv
-
-# Windows
-venv\Scripts\activate
-
-# Mac/Linux
-source venv/bin/activate
+source venv/bin/activate          # Windows: venv\Scripts\activate
+pip install -r requirements-dev.txt
+cp .env.example .env              # fill in the values; AUTH_DISABLED=true locally
+uvicorn main:app --reload         # http://localhost:8000 — syncs on startup
+pytest                            # tests: no keys or network needed
 ```
 
-### 3. Install dependencies
+`python indexer.py` runs a single sync from the command line (add `--full` to re-read
+every file) — useful to check Drive access or do the first load before deploying.
 
-```bash
-pip install -r requirements.txt
-```
-
-> Note: `scikit-learn` installs cleanly on Windows with no C++ build tools required.
-> Total install size is under 50MB.
-
-### 4. Set up your .env file
-
-```bash
-cp .env.example .env
-```
-
-Open `.env` and fill in:
-
-```
-GEMINI_API_KEY=your_gemini_api_key_here
-SHEET_CSV_URL=https://docs.google.com/spreadsheets/...
-GOOGLE_SERVICE_ACCOUNT_JSON={"type":"service_account",...}
-```
-
-**To get `GOOGLE_SERVICE_ACCOUNT_JSON`:**  
-On Windows (PowerShell):
-```powershell
-Get-Content service_account.json | python -c "import sys,json; print(json.dumps(json.load(sys.stdin)))"
-```
-On Mac/Linux:
+**To get `GOOGLE_SERVICE_ACCOUNT_JSON` as one line:**
 ```bash
 python3 -c "import json; print(json.dumps(json.load(open('service_account.json'))))"
 ```
-Paste the single-line output as the value of `GOOGLE_SERVICE_ACCOUNT_JSON` in your `.env`.
-
-### 5. Index your documents (run once)
-
-```bash
-python indexer.py
-```
-
-This will:
-- Fetch your Google Sheet to get all file names and Drive links
-- Download and extract text from every supported file (PDF, PPTX, DOCX, Google Docs/Slides)
-- Skip videos, audio, and images automatically
-- Store everything in `search_index.json` locally
-
-This takes a few minutes depending on how many files you have.  
-**Re-run whenever you add new files to your Drive folder.**
-
-### 6. Start the backend server
-
-```bash
-uvicorn main:app --reload
-```
-
-The server runs at `http://localhost:8000`.  
-Open `http://localhost:8000` in your browser — you should see a JSON health check.
-
-### 7. Open the frontend
-
-Open `onehope_assistant_frontend.html` directly in your browser.  
-It will connect to `http://localhost:8000` automatically.
 
 ---
 
-## Deploying to production (Railway)
+## What gets read
 
-1. Push this folder to a GitHub repository  
-   (Make sure `.env` and `service_account.json` are in `.gitignore`)
-
-2. Go to [railway.app](https://railway.app) → New Project → Deploy from GitHub
-
-3. Add your environment variables in Railway's dashboard (same keys as your `.env`)
-
-4. Railway will run `uvicorn main:app --host 0.0.0.0 --port $PORT` automatically
-
-5. Once deployed, update `BACKEND_URL` in `onehope_assistant_frontend.html`:
-   ```js
-   const BACKEND_URL = 'https://your-app.railway.app';
-   ```
-
----
-
-## Supported file types
-
-| Type | Supported |
+| Type | Result |
 |---|---|
-| PDF | ✅ |
-| Google Docs | ✅ |
-| Google Slides | ✅ |
-| .pptx | ✅ |
-| .docx | ✅ |
-| MP4 / MOV / video | ⏭ Skipped |
-| MP3 / audio | ⏭ Skipped |
-| PNG / JPG / images | ⏭ Skipped |
-| .DS_Store | ⏭ Skipped |
+| PDF, .docx, .pptx, .xlsx, Google Docs / Slides / Sheets | Full text searchable |
+| Video, audio, images | Found by title and folder (e.g. "what films do we have in Luganda?") |
+| Scanned PDFs (no text layer) | Found by title only |
+| Old .doc / .ppt, other formats | Found by title only |
+| Files over `MAX_FILE_MB` | Found by title only |
+
+Files that fail to read are retried every 6 hours, and immediately when they're edited.
 
 ---
 
-## API Endpoints
+## API endpoints
 
-| Method | Path | Description |
-|---|---|---|
-| GET | `/` | Health check — shows docs indexed count |
-| GET | `/index-status` | Detailed search index index info |
-| POST | `/chat` | Main chat endpoint |
-| POST | `/reindex` | Manually trigger a full re-index of Drive documents |
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| GET | `/` | public | Health check (also the keep-awake URL) |
+| GET | `/me` | signed in | Current user's email and whether they are an admin |
+| GET | `/index-status` | signed in | Library size, files by status, last sync result |
+| POST | `/chat` | signed in | Main chat endpoint |
+| POST | `/reindex` | admin | Sync with Drive now; `?full=true` re-reads every file |
 
-### POST /chat request body
+### POST /chat
 
+Request:
 ```json
 {
   "message": "Where can I find the Africa Manual?",
@@ -182,64 +152,28 @@ It will connect to `http://localhost:8000` automatically.
 }
 ```
 
-### POST /chat response
-
+Response:
 ```json
 {
   "answer": "The OneHope Africa Manual v2.1 covers...",
-  "sources": [
-    {
-      "file_name": "OneHope Africa Manual v2.1.pdf",
-      "drive_url": "https://drive.google.com/...",
-      "folder": "Manuals"
-    }
-  ]
+  "sources": [{"file_name": "OneHope Africa Manual v2.1.pdf", "drive_url": "https://drive.google.com/...", "folder": "Manuals"}],
+  "suggestions": ["...", "...", "..."],
+  "needs_clarification": false
 }
 ```
 
 ---
 
-## Keeping the index up to date
-
-The backend automatically re-indexes your Drive documents every night at **2:00 AM server time**.  
-This means new files you upload to Drive will be searchable by the next morning — no action needed.
-
-### Trigger a manual re-index immediately
-
-If you upload a new file and don't want to wait until 2 AM, hit this endpoint:
-
-```bash
-curl -X POST http://localhost:8000/reindex
-```
-
-Or just open `http://localhost:8000/reindex` in a REST client (Postman, Insomnia, etc).  
-The re-index runs in the background — check your server terminal logs for progress.
-
-### What updates automatically vs. what needs a re-index
-
-| Change | Auto-updates? |
-|---|---|
-| New row added to Google Sheet | ✅ Within 30 minutes (sheet is cached) |
-| New file uploaded to Drive | ⏰ Next night at 2 AM (or manual `/reindex`) |
-| File content changed in Drive | ⏰ Next night at 2 AM (or manual `/reindex`) |
-| File deleted from Drive | ⏰ Next night at 2 AM (or manual `/reindex`) |
-
----
-
 ## Troubleshooting
 
-**`GOOGLE_SERVICE_ACCOUNT_JSON is not set`**  
-→ Make sure your `.env` file exists and has the variable set.
+Check `GET /index-status` (signed in) — `last_sync.error` says what went wrong.
 
-**`search index not found. Run python indexer.py first`**  
-→ You need to run `python indexer.py` before starting the server.
+**"The Drive listing came back empty"** → the folder isn't shared with the service account, or `DRIVE_FOLDER_ID` is wrong. Nothing is deleted when this happens.
 
-**`Quota exceeded` from Gemini**  
-→ You've hit your API rate limit. Wait for the quota to reset or enable billing in Google AI Studio.
+**"Not configured: GOOGLE_SERVICE_ACCOUNT_JSON…"** → set the service-account key on the server.
 
-**`Could not reach backend` in the frontend**  
-→ Make sure `uvicorn main:app --reload` is running in a terminal.
+**A new file isn't showing up** → wait for the next sync (or click **Sync from Drive** as an admin), then check `files_by_status`: it may be a scanned PDF (`empty`) or too large (`too_large`).
 
-**Files not being indexed**  
-→ Confirm the service account email has **Viewer** access to your Drive folder.  
-→ Check that the Google Drive API is enabled in your Google Cloud project.
+**`Sign-in is not configured on the server` (503)** → set `GOOGLE_CLIENT_ID` (or `AUTH_DISABLED=true` locally).
+
+**`The AI service is busy`** → every Groq model failed; check the server logs and your Groq quota.

@@ -22,9 +22,8 @@
 cd onehope-backend
 pip install -r requirements.txt
 cp .env.example .env
-# Fill in your values in .env
-python indexer.py          # first-time index
-uvicorn main:app --reload  # starts on http://localhost:8000
+# Fill in your values in .env (DRIVE_FOLDER_ID, service account, AUTH_DISABLED=true)
+uvicorn main:app --reload  # starts on http://localhost:8000 and syncs from Drive
 ```
 
 Open `onehope-frontend/index.html` in your browser.
@@ -40,15 +39,22 @@ Open `onehope-frontend/index.html` in your browser.
 5. Start command: `uvicorn main:app --host 0.0.0.0 --port $PORT`
 6. Add these Environment Variables in the Render dashboard:
    - `GROQ_API_KEY`
-   - `SHEET_CSV_URL`
+   - `DRIVE_FOLDER_ID` (the resources folder — share it with the service account's email as Viewer)
+   - `DATABASE_URL` (free [Neon](https://neon.com) Postgres connection string)
    - `GOOGLE_SERVICE_ACCOUNT_JSON`
-   - `GOOGLE_CLIENT_ID` (optional — leave blank to disable auth)
+   - `SHEET_CSV_URL` (optional — extra details from the resource sheet)
+   - `GOOGLE_CLIENT_ID` (required — without it the API refuses requests)
    - `ALLOWED_DOMAIN` (optional — e.g. `onehope.net`)
+   - `ADMIN_EMAILS` (comma-separated — who can use **Sync from Drive**)
+   - `ALLOWED_ORIGINS` (your Netlify URL, e.g. `https://onehope-resources.netlify.app`)
 7. Deploy. Copy the URL (e.g. `https://onehope-xxx.onrender.com`).
+8. At [cron-job.org](https://cron-job.org), create a free job that requests that URL every
+   10 minutes. This stops Render's free tier from putting the server to sleep, so the
+   Drive sync keeps running.
 
-> ⚠️ **search_index.json on Render**: Render's free tier has an ephemeral filesystem — it resets on every deploy. You have two options:
-> - **Option A (easiest)**: Run `python indexer.py` locally, commit `search_index.json` to your repo, and let Render deploy it.
-> - **Option B**: Use a free [Supabase Storage](https://supabase.com) bucket and update `INDEX_PATH` in main.py and indexer.py to read/write from the bucket URL.
+> Documents are stored in the Postgres database, not in the repo or on Render's disk
+> (which is wiped on every restart). Without `DATABASE_URL` the app still works, but
+> re-reads every document from Drive after each restart.
 
 ---
 
@@ -81,17 +87,16 @@ Open `onehope-frontend/index.html` in your browser.
 9. In Render dashboard: set `GOOGLE_CLIENT_ID` to the same value.
 10. Optionally set `ALLOWED_DOMAIN=onehope.net` to restrict sign-in to your org.
 
-> 💡 If you leave `GOOGLE_CLIENT_ID` blank in both the frontend and backend `.env`, auth is fully disabled and the app works without sign-in — great for internal local use.
+> 💡 For local development without sign-in, leave `GOOGLE_CLIENT_ID` blank in the frontend and set `AUTH_DISABLED=true` in the backend `.env`. A blank `GOOGLE_CLIENT_ID` on its own no longer disables auth — the server refuses requests instead, so a missing setting in production can't open the API to the public.
 
 ---
 
-## Running the Indexer
+## Keeping documents up to date
 
-| Method | Command |
-|--------|---------|
-| Direct (recommended) | `cd onehope-backend && python indexer.py` |
-| HTTP (server running) | `curl -X POST http://localhost:8000/reindex` |
-| UI button | Click **Refresh Index** in the sidebar |
-| Automatic | Every night at 2:00 AM server time |
+| Method | How |
+|--------|-----|
+| Automatic (normal) | Add, edit or delete files in the Drive folder — synced every 10 minutes |
+| UI button (admins only) | Click **Sync from Drive** in the sidebar to sync immediately |
+| Command line | `cd onehope-backend && python indexer.py` (`--full` re-reads every file) |
 
-Poll progress: `GET /index-status` → `{ "in_progress": true/false, "total_chunks": N }`
+Check progress: `GET /index-status` → `in_progress`, `files_by_status`, `last_sync`
