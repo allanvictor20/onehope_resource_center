@@ -12,19 +12,22 @@ import logging
 import threading
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
+from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Literal, Optional
 
-import numpy as np
 from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from groq import Groq
 from apscheduler.schedulers.background import BackgroundScheduler
-from sklearn.feature_extraction.text import TfidfVectorizer, ENGLISH_STOP_WORDS
 
-from sheet_utils import fetch_sheet, sheet_to_catalog, doc_key, display_name, fix_mojibake
+from doc_store import DocStore
+from drive_reader import extract_file_id
+from drive_sync import configured_source, sync_from_env
+from search import Catalog, SearchIndex, build_chunks, build_context, kind_of
+from sheet_utils import fetch_sheet, sheet_to_catalog, doc_key, display_name
 
 try:
     from google.oauth2 import id_token as google_id_token
@@ -56,19 +59,14 @@ ALLOWED_ORIGINS  = _env_list("ALLOWED_ORIGINS")
 AUTH_DISABLED    = os.environ.get("AUTH_DISABLED", "").lower() in ("1", "true", "yes")
 RATE_LIMIT_PER_MINUTE = int(os.environ.get("RATE_LIMIT_PER_MINUTE", "10"))
 
-INDEX_PATH        = os.path.join(os.path.dirname(os.path.abspath(__file__)), "search_index.json")
-TOP_K_CHUNKS      = 6
-MAX_CHUNKS_PER_DOC = 2
-MIN_SCORE         = 0.03
-MAX_CONTEXT_CHARS = 12000
 SHEET_CACHE_TTL   = 1800
-CATALOG_MATCHES   = 8
 MAX_SOURCES       = 6
 GROQ_TIMEOUT      = 30
 TEMPERATURE       = 0.3
 MAX_MESSAGE_CHARS = 2000
 MAX_HISTORY_TURNS = 10
 MAX_HISTORY_CHARS = 1500
+SYNC_INTERVAL_MINUTES = max(1, int(os.environ.get("SYNC_INTERVAL_MINUTES", "10")))
 
 # Current Groq production models, best first. Override with GROQ_MODELS=a,b,c
 GROQ_MODELS = _env_list("GROQ_MODELS") or [
@@ -79,216 +77,127 @@ GROQ_MODELS = _env_list("GROQ_MODELS") or [
 ]
 
 
-# ── SEARCH INDEX ──────────────────────────────────────────────────────────────
-# Word TF-IDF over the chunks, plus a small spelling corrector over the index
-# vocabulary so that typos ("sparck", "mentorhsip") still find the right terms.
-# The corrector works on unique words only, so memory stays small even when
-# full documents are indexed.
+# ── LIBRARY STATE ─────────────────────────────────────────────────────────────
+# The document store is the source of truth; the search index and catalogue
+# are rebuilt in memory from it after each sync that changes something.
 
-_TOKEN_RE = re.compile(r"(?u)\b\w\w+\b")
-
-
-class TermCorrector:
-    def __init__(self, vocabulary):
-        self.terms = [t for t in vocabulary if " " not in t and len(t) >= 4 and t.isalpha()]
-        self.known = set(self.terms)
-        self.first_letters = np.array([t[0] for t in self.terms])
-        self.lengths = np.array([len(t) for t in self.terms])
-        self.vec = None
-        self.matrix = None
-        if self.terms:
-            self.vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 3), lowercase=True)
-            self.matrix = self.vec.fit_transform(self.terms)
-
-    def expand(self, query: str, min_sim: float = 0.5) -> str:
-        """Returns the query plus the closest known word for each unknown word."""
-        if self.matrix is None:
-            return query
-        unknown = [t for t in _TOKEN_RE.findall(query.lower())
-                   if len(t) >= 5 and t.isalpha() and t not in self.known and t not in ENGLISH_STOP_WORDS]
-        extra = []
-        for token in unknown[:8]:
-            sims = (self.matrix @ self.vec.transform([token]).T).toarray().ravel()
-            # Typos almost always keep the first letter; requiring it stops
-            # e.g. "Luganda" being "corrected" to "uganda".
-            sims[self.first_letters != token[0]] = 0
-            sims[np.abs(self.lengths - len(token)) > 2] = 0
-            best = int(sims.argmax())
-            if sims[best] >= min_sim:
-                extra.append(self.terms[best])
-        return f"{query} {' '.join(extra)}" if extra else query
-
-
-class SearchIndex:
-    def __init__(self, chunks: list):
-        self.chunks = chunks
-        self.vec = None
-        self.matrix = None
-        self.corrector = TermCorrector([])
-        if not chunks:
-            return
-        for chunk in chunks:
-            chunk["file_name"] = fix_mojibake(chunk.get("file_name", "Unknown"))
-            chunk["folder"] = fix_mojibake(chunk.get("folder", "General"))
-            chunk["doc_key"] = doc_key(chunk["file_name"])
-        # Title is included so questions naming a resource find it.
-        texts = [f"{display_name(c['file_name'])}. {c['text']}" for c in chunks]
-        self.vec = TfidfVectorizer(
-            strip_accents="unicode", lowercase=True, ngram_range=(1, 2),
-            max_df=0.95, sublinear_tf=True, stop_words="english",
-        )
-        self.matrix = self.vec.fit_transform(texts)
-        self.corrector = TermCorrector(self.vec.vocabulary_.keys())
-
-    @property
-    def ready(self) -> bool:
-        return self.matrix is not None
-
-    def search(self, query: str, top_k: int = TOP_K_CHUNKS) -> list:
-        if not self.ready or not query.strip():
-            return []
-        q = self.vec.transform([self.corrector.expand(query)])
-        scores = (self.matrix @ q.T).toarray().ravel()
-
-        results, per_doc, first_file, seen_text = [], defaultdict(int), {}, set()
-        for idx in scores.argsort()[::-1]:
-            score = float(scores[idx])
-            if score < MIN_SCORE or len(results) >= top_k:
-                break
-            chunk = self.chunks[idx]
-            key = chunk["doc_key"]
-            fingerprint = hash(chunk["text"][:300])
-            # Skip exact duplicates (same file listed twice in the sheet) and
-            # the other format of the same lesson (PDF vs PPTX), and cap
-            # chunks per document so one manual can't crowd out the rest.
-            if fingerprint in seen_text:
-                continue
-            if first_file.setdefault(key, chunk["file_name"]) != chunk["file_name"]:
-                continue
-            if per_doc[key] >= MAX_CHUNKS_PER_DOC:
-                continue
-            seen_text.add(fingerprint)
-            per_doc[key] += 1
-            results.append({**chunk, "score": score})
-        return results
-
-
-class Catalog:
-    """Title-level search over the Google Sheet, which also lists media
-    (videos, images) that have no extractable text."""
-
-    def __init__(self, entries: list):
-        self.entries = entries
-        self.vec = None
-        self.matrix = None
-        if entries:
-            texts = [f"{display_name(e['file_name'])} {e['folder']} {e['details']}" for e in entries]
-            self.vec = TfidfVectorizer(
-                strip_accents="unicode", lowercase=True, analyzer="char_wb", ngram_range=(3, 5),
-            )
-            self.matrix = self.vec.fit_transform(texts)
-
-    def search(self, query: str, top_k: int = CATALOG_MATCHES, min_score: float = 0.12) -> list:
-        if self.matrix is None:
-            return []
-        scores = (self.matrix @ self.vec.transform([query]).T).toarray().ravel()
-        out, seen = [], set()
-        for idx in scores.argsort()[::-1]:
-            if scores[idx] < min_score or len(out) >= top_k:
-                break
-            entry = self.entries[idx]
-            key = doc_key(entry["file_name"])
-            if key in seen:
-                continue
-            seen.add(key)
-            out.append(entry)
-        return out
-
-
+_store: Optional[DocStore] = None
 _index = SearchIndex([])
-_last_reindex_time: Optional[str] = None
-_reindex_lock = threading.Lock()
+_catalog = Catalog([])
+_doc_meta: list = []            # every stored file, without text
+_sync_lock = threading.Lock()
+_sync_progress: dict = {"running": False, "full": False, "started_at": None}
+_last_sync: Optional[dict] = None   # most recent sync attempt, kept in memory
 
 
-def load_search_index():
-    global _index
-    if not os.path.exists(INDEX_PATH):
-        logger.warning("search_index.json not found. Run 'python indexer.py' first.")
-        _index = SearchIndex([])
-        return
-    with open(INDEX_PATH, "r", encoding="utf-8") as f:
-        chunks = json.load(f)
-    new_index = SearchIndex(chunks)   # build fully, then swap in one assignment
+def get_store() -> DocStore:
+    global _store
+    if _store is None:
+        _store = DocStore()
+    return _store
+
+
+def rebuild_index() -> None:
+    """Rebuilds search + catalogue from the store, then swaps them in."""
+    global _index, _doc_meta
+    t0 = time.time()
+    docs = get_store().all_documents()
+    new_index = SearchIndex(build_chunks(docs))
+    _doc_meta = [{k: v for k, v in d.items() if k != "text"} for d in docs]
     _index = new_index
-    if not chunks:
-        logger.warning("search_index.json is empty.")
-    else:
-        docs = len({c["doc_key"] for c in chunks})
-        logger.info(f"Search index loaded: {len(chunks)} chunks from {docs} documents")
+    _rebuild_catalog()
+    logger.info(f"Search ready: {sum(1 for d in docs if d.get('text'))} searchable documents, "
+                f"{len(new_index.chunks)} passages, {len(docs)} files in catalogue "
+                f"({time.time() - t0:.1f}s)")
 
 
-def build_context(chunks: list, max_chars: int = MAX_CONTEXT_CHARS):
-    """Returns (context_text, chunks_actually_included)."""
-    parts, used, total = [], [], 0
-    for chunk in chunks:
-        block = f"[From: {display_name(chunk['file_name'])}]\n{chunk['text']}"
-        if total + len(block) > max_chars:
-            remaining = max_chars - total
-            if remaining > 500:
-                parts.append(block[:remaining] + "…")
-                used.append(chunk)
-            break
-        parts.append(block)
-        used.append(chunk)
-        total += len(block)
-    return "\n\n".join(parts), used
+# ── CATALOGUE (every file, optionally enriched by the resource sheet) ─────────
+
+_sheet_cache: dict = {"entries": [], "last_fetched": 0.0, "loaded": False}
+_sheet_lock = threading.Lock()
 
 
-# ── SHEET CATALOG CACHE ───────────────────────────────────────────────────────
+def _rebuild_catalog() -> None:
+    global _catalog
+    sheet_by_id = {}
+    for entry in _sheet_cache["entries"]:
+        fid = extract_file_id(entry["drive_url"])
+        if fid:
+            sheet_by_id[fid] = entry
 
-_catalog_cache: dict = {"catalog": Catalog([]), "last_fetched": 0.0, "loaded": False}
-_catalog_lock = threading.Lock()
+    entries, seen = [], set()
+    for d in _doc_meta:
+        sheet = sheet_by_id.get(d["file_id"], {})
+        details = "; ".join(x for x in (kind_of(d.get("mime_type")), sheet.get("details", "")) if x)
+        entries.append({"file_name": d["name"], "drive_url": d["drive_url"],
+                        "folder": d.get("folder") or "General", "details": details})
+        seen.add(d["file_id"])
+    # Sheet rows pointing outside the synced folder still show up by title.
+    for fid, entry in sheet_by_id.items():
+        if fid not in seen:
+            entries.append(entry)
+    _catalog = Catalog(entries)
 
 
 def get_catalog() -> Catalog:
-    now = time.time()
-    if _catalog_cache["loaded"] and now - _catalog_cache["last_fetched"] < SHEET_CACHE_TTL:
-        return _catalog_cache["catalog"]
+    """Returns the catalogue, refreshing the optional sheet details every 30 min."""
     if not SHEET_CSV_URL:
-        return _catalog_cache["catalog"]
-    with _catalog_lock:
-        if _catalog_cache["loaded"] and time.time() - _catalog_cache["last_fetched"] < SHEET_CACHE_TTL:
-            return _catalog_cache["catalog"]
-        try:
-            entries = sheet_to_catalog(fetch_sheet(SHEET_CSV_URL, timeout=20))
-            _catalog_cache.update(catalog=Catalog(entries), last_fetched=time.time(), loaded=True)
-            logger.info(f"Sheet catalogue refreshed: {len(entries)} resources")
-        except Exception as e:
-            # Keep serving the stale copy, but retry in 5 minutes rather than 30.
-            logger.error(f"Failed to fetch sheet: {e}")
-            _catalog_cache["last_fetched"] = time.time() - SHEET_CACHE_TTL + 300
-    return _catalog_cache["catalog"]
-
-
-# ── RE-INDEX ──────────────────────────────────────────────────────────────────
-
-def run_scheduled_reindex():
-    global _last_reindex_time
-    if not _reindex_lock.acquire(blocking=False):
-        logger.warning("Re-index already running, skipping.")
-        return
-    logger.info("⏰ Re-index starting...")
+        return _catalog
+    if _sheet_cache["loaded"] and time.time() - _sheet_cache["last_fetched"] < SHEET_CACHE_TTL:
+        return _catalog
+    if not _sheet_lock.acquire(blocking=False):
+        return _catalog
     try:
-        from indexer import run_indexer
-        run_indexer()
-        load_search_index()
-        _catalog_cache["loaded"] = False
-        _last_reindex_time = datetime.now(timezone.utc).isoformat()
-        logger.info("✅ Re-index complete.")
+        entries = sheet_to_catalog(fetch_sheet(SHEET_CSV_URL, timeout=20))
+        _sheet_cache.update(entries=entries, last_fetched=time.time(), loaded=True)
+        _rebuild_catalog()
+        logger.info(f"Resource sheet refreshed: {len(entries)} rows")
     except Exception as e:
-        logger.error(f"❌ Re-index failed: {e}")
+        # Keep serving the stale copy, but retry in 5 minutes rather than 30.
+        logger.error(f"Failed to fetch sheet: {e}")
+        _sheet_cache["last_fetched"] = time.time() - SHEET_CACHE_TTL + 300
     finally:
-        _reindex_lock.release()
+        _sheet_lock.release()
+    return _catalog
+
+
+# ── DRIVE SYNC ────────────────────────────────────────────────────────────────
+
+def run_sync(full: bool = False) -> None:
+    """Brings the store up to date with Drive. Safe to call from any thread:
+    overlapping calls are skipped."""
+    if not _sync_lock.acquire(blocking=False):
+        logger.info("Sync already running, skipping.")
+        return
+    global _last_sync
+    started = datetime.now(timezone.utc).isoformat()
+    _sync_progress.update(running=True, full=full, started_at=started)
+    try:
+        result = sync_from_env(get_store(), full=full, on_batch=rebuild_index)
+        _last_sync = asdict(result)
+        if result.changed or result.failed:
+            rebuild_index()
+    except EnvironmentError as e:
+        logger.warning(f"Drive sync is not configured: {e}")
+        _last_sync = {"started_at": started, "finished_at": None, "error": f"Not configured: {e}"}
+    except Exception as e:
+        logger.error(f"❌ Drive sync failed: {e}")
+        _last_sync = {"started_at": started, "finished_at": None, "error": str(e)[:500]}
+    finally:
+        _sync_progress["running"] = False
+        _sync_lock.release()
+
+
+def last_sync() -> Optional[dict]:
+    """The latest sync attempt; read from the database only once after a restart."""
+    global _last_sync
+    if _last_sync is None:
+        try:
+            raw = get_store().get_state("last_sync")
+            _last_sync = json.loads(raw) if raw else {}
+        except Exception:
+            _last_sync = {}
+    return _last_sync or None
 
 
 # ── AUTH ──────────────────────────────────────────────────────────────────────
@@ -533,17 +442,29 @@ async def lifespan(app: FastAPI):
     elif not GOOGLE_CLIENT_ID:
         logger.error("GOOGLE_CLIENT_ID is not set: /chat will refuse all requests until it is.")
     if not ADMIN_EMAILS and not AUTH_DISABLED:
-        logger.warning("ADMIN_EMAILS is empty: nobody can trigger a manual re-index.")
+        logger.warning("ADMIN_EMAILS is empty: nobody can trigger a manual sync.")
 
-    load_search_index()
+    store = get_store()
+    if store.is_sqlite:
+        logger.warning("DATABASE_URL is not set — using a local SQLite file. On Render's free tier this "
+                       "is wiped on restart and every document is re-read from Drive. Set DATABASE_URL "
+                       "to a free Neon/Supabase Postgres to keep it.")
+    rebuild_index()          # serve what we already have straight away
     get_catalog()
 
     scheduler = BackgroundScheduler()
-    scheduler.add_job(run_scheduled_reindex, trigger="cron", hour=2, minute=0,
-                      id="nightly_reindex", replace_existing=True)
+    source = configured_source()
+    if source:
+        # First run happens immediately, then every SYNC_INTERVAL_MINUTES.
+        scheduler.add_job(run_sync, trigger="interval", minutes=SYNC_INTERVAL_MINUTES,
+                          next_run_time=datetime.now(timezone.utc), id="drive_sync",
+                          max_instances=1, coalesce=True, replace_existing=True)
+        logger.info(f"Drive sync ({source}) every {SYNC_INTERVAL_MINUTES} minutes.")
+    else:
+        logger.warning("No DRIVE_FOLDER_ID or SHEET_CSV_URL set — documents will not sync.")
     scheduler.start()
     app.state.scheduler = scheduler
-    logger.info("Backend ready. Nightly re-index scheduled at 2:00 AM.")
+    logger.info("Backend ready.")
     yield
     scheduler.shutdown(wait=False)
     logger.info("Backend shutting down.")
@@ -568,11 +489,15 @@ app.add_middleware(
 
 @app.get("/")
 def health_check():
+    sync = last_sync() or {}
     return {
         "status": "ok",
         "docs_indexed": len({c["doc_key"] for c in _index.chunks}),
         "chunks_indexed": len(_index.chunks),
+        "files_in_library": len(_doc_meta),
         "search_ready": _index.ready,
+        "syncing": _sync_progress["running"],
+        "last_sync": sync.get("finished_at"),
         "auth_enabled": not AUTH_DISABLED,
     }
 
@@ -585,22 +510,32 @@ def me(user=Depends(verify_google_token)):
 
 @app.get("/index-status")
 def index_status(user=Depends(verify_google_token)):
+    store = get_store()
     return {
         "indexed": _index.ready,
         "total_chunks": len(_index.chunks),
         "total_docs": len({c["doc_key"] for c in _index.chunks}),
-        "in_progress": _reindex_lock.locked(),
-        "last_reindex_time": _last_reindex_time,
+        "files_in_library": len(_doc_meta),
+        "files_by_status": store.counts(),
+        "in_progress": _sync_progress["running"],
+        "source": configured_source(),
+        "storage": "sqlite" if store.is_sqlite else "postgres",
+        "sync_interval_minutes": SYNC_INTERVAL_MINUTES,
+        "last_sync": last_sync(),
     }
 
 
 @app.post("/reindex")
-def trigger_reindex(user=Depends(require_admin)):
-    if _reindex_lock.locked():
-        return {"status": "already_running", "message": "Re-index is already in progress."}
-    logger.info(f"Manual re-index requested by {user.get('email')}")
-    threading.Thread(target=run_scheduled_reindex, daemon=True).start()
-    return {"status": "reindex_started", "message": "Re-index started. Poll /index-status for progress."}
+def trigger_sync(full: bool = False, user=Depends(require_admin)):
+    """Syncs with Drive now instead of waiting for the next scheduled run.
+    ?full=true re-reads every file (only needed after changing extraction code)."""
+    if _sync_progress["running"]:
+        return {"status": "already_running", "message": "A sync is already in progress."}
+    if not configured_source():
+        raise HTTPException(status_code=503, detail="Drive sync is not configured on the server.")
+    logger.info(f"Manual {'full ' if full else ''}sync requested by {user.get('email')}")
+    threading.Thread(target=run_sync, kwargs={"full": full}, daemon=True).start()
+    return {"status": "sync_started", "message": "Sync started. Poll /index-status for progress."}
 
 
 @app.post("/chat", response_model=ChatResponse)

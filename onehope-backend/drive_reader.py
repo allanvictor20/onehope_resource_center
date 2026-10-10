@@ -34,8 +34,6 @@ EXTRACTABLE_TYPES = {
     "application/vnd.google-apps.presentation": "gslides",
     "application/vnd.openxmlformats-officedocument.presentationml.presentation": "pptx",
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
-    "application/vnd.ms-powerpoint": "pptx",
-    "application/msword": "docx",
     # NEW: Excel support
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
     "application/vnd.ms-excel": "xlsx",
@@ -133,6 +131,32 @@ def _retry_call(fn, *args, max_retries=MAX_RETRIES, **kwargs):
 
 # ── MAIN ENTRY POINT ──────────────────────────────────────────────────────────
 
+def is_media(mime_type: str) -> bool:
+    return mime_type in SKIP_TYPES or mime_type.split("/")[0] in ("video", "audio", "image")
+
+
+def is_extractable(mime_type: str) -> bool:
+    return mime_type in EXTRACTABLE_TYPES
+
+
+def extract_text(file_id: str, mime_type: str, name: str, service) -> str:
+    """
+    Extracts text from a Drive file whose metadata is already known.
+    Raises on failure so the caller can record the error.
+    """
+    file_type = EXTRACTABLE_TYPES[mime_type]
+    extractor = {
+        "pdf": _extract_pdf,
+        "gdoc": _extract_google_doc,
+        "gslides": _extract_google_slides,
+        "gsheet": _extract_google_sheet,
+        "pptx": _extract_pptx,
+        "docx": _extract_docx,
+        "xlsx": _extract_xlsx,
+    }[file_type]
+    return (extractor(file_id, service, name) or "").replace("\x00", "")
+
+
 def extract_text_from_drive_file(drive_url: str, service) -> Optional[str]:
     file_id = extract_file_id(drive_url)
     if not file_id:
@@ -142,7 +166,8 @@ def extract_text_from_drive_file(drive_url: str, service) -> Optional[str]:
         metadata = _retry_call(
             service.files().get(
                 fileId=file_id,
-                fields="id, name, mimeType"
+                fields="id, name, mimeType",
+                supportsAllDrives=True,
             ).execute
         )
     except Exception as e:
@@ -154,31 +179,12 @@ def extract_text_from_drive_file(drive_url: str, service) -> Optional[str]:
 
     logger.info(f"Processing: {name} | MIME: {mime_type}")
 
-    if mime_type in SKIP_TYPES:
-        logger.info(f"  → Skipping (media/binary file): {name}")
+    if not is_extractable(mime_type):
+        logger.info(f"  → Skipping (media or unsupported type {mime_type}): {name}")
         return None
-
-    if mime_type not in EXTRACTABLE_TYPES:
-        logger.info(f"  → Skipping (unknown MIME type: {mime_type}): {name}")
-        return None
-
-    file_type = EXTRACTABLE_TYPES[mime_type]
 
     try:
-        if file_type == "pdf":
-            return _extract_pdf(file_id, service, name)
-        elif file_type == "gdoc":
-            return _extract_google_doc(file_id, service, name)
-        elif file_type == "gslides":
-            return _extract_google_slides(file_id, service, name)
-        elif file_type == "pptx":
-            return _extract_pptx(file_id, service, name)
-        elif file_type == "docx":
-            return _extract_docx(file_id, service, name)
-        elif file_type == "xlsx":
-            return _extract_xlsx(file_id, service, name)
-        elif file_type == "gsheet":
-            return _extract_google_sheet(file_id, service, name)
+        return extract_text(file_id, mime_type, name, service)
     except Exception as e:
         logger.error(f"  → Extraction failed for {name}: {e}")
         return None
@@ -187,7 +193,7 @@ def extract_text_from_drive_file(drive_url: str, service) -> Optional[str]:
 # ── EXTRACTORS ────────────────────────────────────────────────────────────────
 
 def _download_to_buffer(file_id: str, service) -> io.BytesIO:
-    request = service.files().get_media(fileId=file_id)
+    request = service.files().get_media(fileId=file_id, supportsAllDrives=True)
     buffer = io.BytesIO()
     downloader = MediaIoBaseDownload(buffer, request)
 
@@ -209,6 +215,10 @@ def _extract_pdf(file_id: str, service, name: str) -> str:
             page_text = page.extract_text()
             if page_text:
                 text += page_text + "\n"
+            # Free each page's parsed objects; big manuals otherwise use a
+            # lot of memory on a small server.
+            if hasattr(page, "close"):
+                page.close()
             if len(text) >= MAX_CHARS_PER_DOC:
                 break
 

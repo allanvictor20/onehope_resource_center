@@ -10,17 +10,14 @@ import pytest
 from fastapi.testclient import TestClient
 
 import main
+import search
+from search import build_context, chunk_text
 from sheet_utils import fix_mojibake, doc_key, display_name, sheet_to_catalog
 
 
 # ── FIXTURES ──────────────────────────────────────────────────────────────────
-
-@pytest.fixture(scope="module", autouse=True)
-def real_index():
-    """Loads the committed search_index.json once for the whole module."""
-    main.load_search_index()
-    assert main._index.ready, "search_index.json should be present for tests"
-
+# The sample library (made-up documents in a temporary SQLite store) is set
+# up for every test by tests/conftest.py.
 
 @pytest.fixture
 def client(monkeypatch):
@@ -79,7 +76,7 @@ def test_search_finds_named_resource():
 
 
 def test_search_never_returns_both_formats_of_a_lesson():
-    for query in ["what is 1for50", "engaging families", "sharing the gospel with children"]:
+    for query in ["what is 1for50", "1for50 approach slides", "mentorship manual"]:
         results = main._index.search(query)
         files_per_key = {}
         for r in results:
@@ -90,7 +87,8 @@ def test_search_never_returns_both_formats_of_a_lesson():
 def test_search_caps_chunks_per_document():
     results = main._index.search("mentorship")
     keys = [r["doc_key"] for r in results]
-    assert all(keys.count(k) <= main.MAX_CHUNKS_PER_DOC for k in keys)
+    assert len(results) >= 2
+    assert all(keys.count(k) <= search.MAX_CHUNKS_PER_DOC for k in keys)
 
 
 def test_search_skips_duplicate_text():
@@ -108,13 +106,42 @@ def test_typo_tolerance():
     assert main._index.corrector.expand("Luganda resources") == "Luganda resources"
 
 
+def test_chunk_text_overlaps_and_covers_everything():
+    words = [f"w{i}" for i in range(700)]
+    chunks = chunk_text(" ".join(words), size=300, overlap=60)
+    assert len(chunks) == 3
+    assert chunks[0].split()[-60:] == chunks[1].split()[:60]
+    assert chunks[-1].split()[-1] == "w699"
+    assert chunk_text("") == []
+
+
+def test_media_files_are_findable_by_title():
+    hits = main.get_catalog().search("films in Luganda")
+    assert hits and hits[0]["file_name"] == "Jesus Film (Luganda).mp4"
+    assert "video" in hits[0]["details"]
+
+
+def test_sheet_details_enrich_matching_drive_files(monkeypatch):
+    main._sheet_cache["entries"] = [{
+        "file_name": "Spark sheet row", "folder": "Sheet folder", "details": "Audience: Teachers",
+        "drive_url": "https://drive.google.com/file/d/f-spark/view",
+    }, {
+        "file_name": "Outside the folder.pdf", "folder": "Elsewhere", "details": "",
+        "drive_url": "https://drive.google.com/file/d/not-synced/view",
+    }]
+    main._rebuild_catalog()
+    by_name = {e["file_name"]: e for e in main._catalog.entries}
+    assert "Audience: Teachers" in by_name["📄 Spark Empowered Teacher.pptx"]["details"]
+    assert "Outside the folder.pdf" in by_name
+
+
 def test_empty_query_returns_nothing():
     assert main._index.search("   ") == []
 
 
 def test_build_context_respects_budget_and_reports_used_chunks():
     chunks = [{"file_name": f"Doc {i}.pdf", "text": "word " * 1000} for i in range(10)]
-    context, used = main.build_context(chunks, max_chars=12000)
+    context, used = build_context(chunks, max_chars=12000)
     assert len(context) <= 12000 + 10
     assert 0 < len(used) < len(chunks)
     for chunk in used:
@@ -130,7 +157,7 @@ def test_catalog_finds_media_by_language_column():
         "Folder": ["Movies", "Manuals", "Movies"],
         "Language": ["Luganda", "English", "Runyankole"],
     })
-    catalog = main.Catalog(sheet_to_catalog(df))
+    catalog = search.Catalog(sheet_to_catalog(df))
     hits = catalog.search("resources in Luganda")
     assert hits and hits[0]["file_name"] == "Jesus Film.mp4"
 
@@ -205,9 +232,10 @@ def test_domain_restriction(monkeypatch):
 def test_reindex_is_admin_only(monkeypatch):
     monkeypatch.setattr(main, "ALLOWED_DOMAIN", "")
     monkeypatch.setattr(main, "ADMIN_EMAILS", {"admin@onehope.net"})
+    monkeypatch.setattr(main, "configured_source", lambda: "folder")
     started = []
     monkeypatch.setattr(main.threading, "Thread",
-                        lambda target, daemon: type("T", (), {"start": lambda self: started.append(1)})())
+                        lambda target, **kw: type("T", (), {"start": lambda self: started.append(kw)})())
 
     headers = _signed_in_as(monkeypatch, "volunteer@onehope.net")
     c = TestClient(main.app)
@@ -217,7 +245,19 @@ def test_reindex_is_admin_only(monkeypatch):
     headers = _signed_in_as(monkeypatch, "Admin@OneHope.net")
     assert c.post("/reindex", headers=headers).status_code == 200
     assert c.get("/me", headers=headers).json()["is_admin"] is True
-    assert started == [1]
+    assert started == [{"kwargs": {"full": False}, "daemon": True}]
+
+
+def test_sync_endpoint_needs_drive_configured(monkeypatch, client):
+    monkeypatch.setattr(main, "configured_source", lambda: None)
+    assert client.post("/reindex").status_code == 503
+
+
+def test_index_status_reports_library(client):
+    body = client.get("/index-status").json()
+    assert body["files_in_library"] == 8
+    assert body["files_by_status"] == {"indexed": 7, "media": 1}
+    assert body["storage"] == "sqlite"
 
 
 def test_rate_limit(monkeypatch, client, fake_groq):

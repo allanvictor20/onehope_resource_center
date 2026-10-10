@@ -2,8 +2,10 @@
 .env
 service_account.json
 
-# Search index (regenerate with indexer.py)
-#search_index.json
+# Document data — lives in the database now, never in the repo
+search_index.json
+resource_store.db
+resource_store.db-*
 
 # Python
 __pycache__/
