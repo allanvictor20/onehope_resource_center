@@ -124,6 +124,7 @@ python3 -c "import json; print(json.dumps(json.load(open('service_account.json')
 | Scanned PDFs (no text layer) | Found by title only |
 | Old .doc / .ppt, other formats | Found by title only |
 | Files over `MAX_FILE_MB` | Found by title only |
+| A file that made the server run out of memory | Skipped after the restart, found by title only, retried when edited |
 
 Files that fail to read are retried every 6 hours, and immediately when they're edited.
 
@@ -173,6 +174,8 @@ Check `GET /index-status` (signed in) — `last_sync.error` says what went wrong
 **"Not configured: GOOGLE_SERVICE_ACCOUNT_JSON…"** → set the service-account key on the server.
 
 **A new file isn't showing up** → wait for the next sync (or click **Sync from Drive** as an admin), then check `files_by_status`: it may be a scanned PDF (`empty`) or too large (`too_large`).
+
+**Render emails "exceeded its memory limit"** → the free server has 512 MB. The app normally uses ~100 MB at rest and ~250 MB during a full sync (check `memory_mb` in `/index-status`). If one file ever makes the server run out of memory, it is skipped automatically after the restart and shows up as `too_large` in `files_by_status` — it stays findable by title, and is retried if the file is edited.
 
 **`Sign-in is not configured on the server` (503)** → set `GOOGLE_CLIENT_ID` (or `AUTH_DISABLED=true` locally).
 
