@@ -5,14 +5,13 @@ Backend tests. Run from onehope-backend/:
 No API keys or network access needed — Groq and Google are mocked.
 """
 
-import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
 
 import main
 import search
 from search import build_context, chunk_text
-from sheet_utils import fix_mojibake, doc_key, display_name, sheet_to_catalog
+from sheet_utils import Sheet, fix_mojibake, doc_key, display_name, sheet_to_catalog
 
 
 # ── FIXTURES ──────────────────────────────────────────────────────────────────
@@ -151,7 +150,7 @@ def test_build_context_respects_budget_and_reports_used_chunks():
 # ── SHEET CATALOGUE ───────────────────────────────────────────────────────────
 
 def test_catalog_finds_media_by_language_column():
-    df = pd.DataFrame({
+    df = Sheet.from_columns({
         "File Name": ["Jesus Film.mp4", "Spark Manual.pdf", "Bible Stories.mp4"],
         "Link": ["https://drive.google.com/1", "https://drive.google.com/2", "https://drive.google.com/3"],
         "Folder": ["Movies", "Manuals", "Movies"],
@@ -163,7 +162,7 @@ def test_catalog_finds_media_by_language_column():
 
 
 def test_catalog_without_link_column_is_empty():
-    assert sheet_to_catalog(pd.DataFrame({"Name": ["x"]})) == []
+    assert sheet_to_catalog(Sheet.from_columns({"Name": ["x"]})) == []
 
 
 # ── JSON PARSING ──────────────────────────────────────────────────────────────

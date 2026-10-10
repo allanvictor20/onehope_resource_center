@@ -4,6 +4,9 @@ main.py
 OneHope Resource Centre — FastAPI Backend
 """
 
+import memutil
+memutil.tune_malloc()          # before anything big is allocated
+
 import os
 import re
 import json
@@ -26,7 +29,8 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from doc_store import DocStore
 from drive_reader import extract_file_id
 from drive_sync import configured_source, sync_from_env
-from search import Catalog, SearchIndex, build_chunks, build_context, kind_of
+from memutil import release_memory, rss_mb
+from search import Catalog, SearchIndex, build_context, kind_of
 from sheet_utils import fetch_sheet, sheet_to_catalog, doc_key, display_name
 
 try:
@@ -101,14 +105,21 @@ def rebuild_index() -> None:
     """Rebuilds search + catalogue from the store, then swaps them in."""
     global _index, _doc_meta
     t0 = time.time()
-    docs = get_store().all_documents()
-    new_index = SearchIndex(build_chunks(docs))
-    _doc_meta = [{k: v for k, v in d.items() if k != "text"} for d in docs]
+    meta = []
+
+    def documents():
+        for d in get_store().iter_documents():
+            meta.append({k: v for k, v in d.items() if k != "text"})
+            yield d
+
+    new_index = SearchIndex(documents())
+    _doc_meta = meta
     _index = new_index
+    del new_index
     _rebuild_catalog()
-    logger.info(f"Search ready: {sum(1 for d in docs if d.get('text'))} searchable documents, "
-                f"{len(new_index.chunks)} passages, {len(docs)} files in catalogue "
-                f"({time.time() - t0:.1f}s)")
+    release_memory()
+    logger.info(f"Search ready: {len(_index.doc_texts)} searchable documents, {_index.num_chunks} passages, "
+                f"{len(meta)} files in catalogue ({time.time() - t0:.1f}s, memory {rss_mb()} MB)")
 
 
 # ── CATALOGUE (every file, optionally enriched by the resource sheet) ─────────
@@ -492,8 +503,8 @@ def health_check():
     sync = last_sync() or {}
     return {
         "status": "ok",
-        "docs_indexed": len({c["doc_key"] for c in _index.chunks}),
-        "chunks_indexed": len(_index.chunks),
+        "docs_indexed": _index.num_docs,
+        "chunks_indexed": _index.num_chunks,
         "files_in_library": len(_doc_meta),
         "search_ready": _index.ready,
         "syncing": _sync_progress["running"],
@@ -513,8 +524,9 @@ def index_status(user=Depends(verify_google_token)):
     store = get_store()
     return {
         "indexed": _index.ready,
-        "total_chunks": len(_index.chunks),
-        "total_docs": len({c["doc_key"] for c in _index.chunks}),
+        "total_chunks": _index.num_chunks,
+        "total_docs": _index.num_docs,
+        "memory_mb": rss_mb(),
         "files_in_library": len(_doc_meta),
         "files_by_status": store.counts(),
         "in_progress": _sync_progress["running"],
