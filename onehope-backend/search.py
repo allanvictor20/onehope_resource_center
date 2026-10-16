@@ -31,7 +31,7 @@ from typing import Iterable
 
 import numpy as np
 
-from sheet_utils import doc_key, display_name, fix_mojibake
+from sheet_utils import doc_key, display_name, fix_mojibake, is_junk_file
 
 TOP_K_CHUNKS       = 6
 MAX_CHUNKS_PER_DOC = 2
@@ -120,12 +120,71 @@ _KIND_BY_MIME = {
 }
 
 
-def kind_of(mime_type: str) -> str:
+# Used when Drive gives no useful MIME type (sheet rows, octet-stream uploads,
+# or .ts video files that some uploads report as application/octet-stream).
+_KIND_BY_EXTENSION = {
+    **dict.fromkeys(("mp4", "ts", "mov", "mkv", "avi", "m4v", "webm", "wmv", "mpg", "mpeg", "3gp"), "video"),
+    **dict.fromkeys(("mp3", "wav", "m4a", "aac", "ogg", "wma", "flac"), "audio"),
+    **dict.fromkeys(("png", "jpg", "jpeg", "gif", "webp", "heic", "svg"), "image"),
+    "pdf": "PDF document",
+    **dict.fromkeys(("pptx", "ppt"), "slides"),
+    **dict.fromkeys(("docx", "doc"), "Word document"),
+    **dict.fromkeys(("xlsx", "xls", "csv"), "spreadsheet"),
+}
+
+
+def kind_of(mime_type: str, name: str = "") -> str:
     mime_type = mime_type or ""
     for prefix, kind in _KIND_BY_MIME_PREFIX.items():
         if mime_type.startswith(prefix):
             return kind
-    return _KIND_BY_MIME.get(mime_type, "file")
+    if mime_type in _KIND_BY_MIME:
+        return _KIND_BY_MIME[mime_type]
+    ext = name.rsplit(".", 1)[-1].lower() if "." in (name or "") else ""
+    return _KIND_BY_EXTENSION.get(ext, "file")
+
+
+# ── MEDIA-TYPE QUESTIONS ("what films do we have?") ───────────────────────────
+# A question naming a type of resource is answered from the catalogue by type,
+# because titles rarely contain the word the user asks with: nobody names a
+# file "Lumo movie.mp4", and "movies" never matches "video".
+
+_KIND_QUERY_PATTERNS = {
+    "video": re.compile(r"\b(movies?|films?|videos?|trailers?|clips?|dvds?)\b", re.I),
+    "audio": re.compile(r"\b(audios?|songs?|music|recordings?|podcasts?)\b", re.I),
+    "image": re.compile(r"\b(images?|pictures?|photos?|photographs?|posters?|graphics?|logos?)\b", re.I),
+    "slides": re.compile(r"\b(slides?|slideshows?|presentations?|powerpoints?|pptx?|decks?)\b", re.I),
+}
+
+# Words that name the type itself; dropped before narrowing within the type.
+# ("trailer" is kept on purpose: "do you have trailers?" should narrow.)
+_KIND_WORDS = frozenset("""
+movie movies film films video videos clip clips dvd dvds audio audios recording recordings
+image images picture pictures photo photos photograph photographs graphic graphics
+slide slides slideshow slideshows presentation presentations powerpoint powerpoints ppt pptx deck decks
+""".split())
+
+# Words that appear in almost every question and almost every title. Left in,
+# "what movies does OneHope have" matches every file with OneHope in its name.
+_GENERIC_QUERY_WORDS = frozenset("""
+onehope available resource resources material materials library list show give find need want
+please tell know kind kinds type types got see access share send link links has provide
+""".split())
+
+MAX_LISTED = 12
+
+
+def requested_kind(query: str):
+    """The media type a question asks for ("films in Luganda" → "video"), or None."""
+    for kind, pattern in _KIND_QUERY_PATTERNS.items():
+        if pattern.search(query or ""):
+            return kind
+    return None
+
+
+def _strip_generic(query: str, drop_kind_words: bool = False) -> str:
+    drop = _GENERIC_QUERY_WORDS | (_KIND_WORDS if drop_kind_words else frozenset())
+    return " ".join(t for t in tokenize(query) if t not in drop)
 
 
 # ── SPELLING CORRECTOR ────────────────────────────────────────────────────────
@@ -343,14 +402,19 @@ def _char_ngrams(text: str) -> Counter:
 class Catalog:
     """Title-level search over every file in the library, including media
     (videos, images) that have no extractable text. Entries are
-    {file_name, drive_url, folder, details}."""
+    {file_name, drive_url, folder, details, kind}; 'kind' is filled in from
+    the file extension when missing."""
 
     def __init__(self, entries: list):
-        self.entries = entries
+        self.entries = [e for e in entries if not is_junk_file(e.get("file_name", ""))]
+        for e in self.entries:
+            if not e.get("kind"):
+                e["kind"] = kind_of("", e.get("file_name", ""))
         self.vectors = []
         self.idf = {}
-        if not entries:
+        if not self.entries:
             return
+        entries = self.entries
         grams = [_char_ngrams(f"{display_name(e['file_name'])} {e['folder']} {e['details']}") for e in entries]
         df = Counter(g for doc in grams for g in doc)
         n = len(entries)
@@ -362,16 +426,17 @@ class Catalog:
         norm = math.sqrt(sum(v * v for v in vec.values())) or 1.0
         return {g: v / norm for g, v in vec.items()}
 
-    def search(self, query: str, top_k: int = CATALOG_MATCHES, min_score: float = 0.12) -> list:
-        if not self.vectors:
-            return []
+    def _scores(self, query: str, indices) -> list:
+        """(score, index) for the given entries against an already-cleaned query."""
         q = self._normalise({g: c * self.idf[g] for g, c in _char_ngrams(query).items() if g in self.idf})
         if not q:
             return []
-        scores = [sum(w * vec.get(g, 0.0) for g, w in q.items()) for vec in self.vectors]
+        return [(sum(w * self.vectors[i].get(g, 0.0) for g, w in q.items()), i) for i in indices]
+
+    def _pick(self, scored, top_k: int, min_score: float) -> list:
         out, seen = [], set()
-        for idx in sorted(range(len(scores)), key=lambda i: -scores[i]):
-            if scores[idx] < min_score or len(out) >= top_k:
+        for score, idx in sorted(scored, key=lambda s: -s[0]):
+            if score < min_score or len(out) >= top_k:
                 break
             entry = self.entries[idx]
             key = doc_key(entry["file_name"])
@@ -380,6 +445,30 @@ class Catalog:
             seen.add(key)
             out.append(entry)
         return out
+
+    def search(self, query: str, top_k: int = CATALOG_MATCHES, min_score: float = 0.12) -> list:
+        if not self.vectors:
+            return []
+        cleaned = _strip_generic(query)
+        if not cleaned:
+            return []
+        return self._pick(self._scores(cleaned, range(len(self.entries))), top_k, min_score)
+
+    def list_kind(self, kind: str, query: str = "", top_k: int = MAX_LISTED,
+                  min_score: float = 0.08) -> list:
+        """Every resource of one type, for questions like "what films do you
+        have?". Words left after removing the type and filler words narrow the
+        list ("films in Luganda", "the God Man film"); if they match nothing of
+        that type, nothing is returned and normal search answers instead."""
+        indices = [i for i, e in enumerate(self.entries) if e.get("kind") == kind]
+        if not indices:
+            return []
+        narrowing = _strip_generic(query, drop_kind_words=True)
+        if not narrowing:
+            ordered = sorted(indices, key=lambda i: (self.entries[i]["folder"].lower(),
+                                                     display_name(self.entries[i]["file_name"]).lower()))
+            return self._pick([(1.0, i) for i in ordered], top_k, 0.0)
+        return self._pick(self._scores(narrowing, indices), top_k, min_score)
 
 
 def build_context(chunks: list, max_chars: int = MAX_CONTEXT_CHARS):

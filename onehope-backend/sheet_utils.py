@@ -56,6 +56,18 @@ def display_name(file_name: str) -> str:
     return re.sub(r"^[^\w(\[]+", "", name).strip() or name
 
 
+# Operating-system clutter that gets uploaded along with real folders.
+_JUNK_NAMES = frozenset({".ds_store", "thumbs.db", "desktop.ini"})
+
+
+def is_junk_file(name: str) -> bool:
+    """True for files nobody ever wants as a resource (.DS_Store, ._ copies,
+    Office lock files), with or without a leading 📄 marker."""
+    base = fix_mojibake(name or "").strip().rsplit("/", 1)[-1].lower()
+    base = re.sub(r"^[^\w.~]+", "", base)     # strip 📄 markers but keep a leading dot
+    return base in _JUNK_NAMES or base.startswith("._") or base.startswith("~$")
+
+
 # ── SHEET LOADING ─────────────────────────────────────────────────────────────
 # Plain csv instead of pandas: pandas adds ~40 MB of memory just to read a
 # small spreadsheet, and the server only has 512 MB.
@@ -127,6 +139,65 @@ def _clean(value) -> str:
     return "" if text.lower() in ("nan", "none") else fix_mojibake(text)
 
 
+# ── FOLDER-TREE SHEETS ────────────────────────────────────────────────────────
+# The "OneHope Resource Centre Folder Structure" sheet lists the Drive tree:
+#   Hierarchy | Name                              | Type   | Size | Link
+#   2.1.1.3.  |             📁 The God Man Movie   | Folder | -    | …
+#             |                 📄 English ….mp4    | File   | 259 MB | …
+# File rows have no Hierarchy value; their folder is the indentation.
+
+_HIERARCHY_RE = re.compile(r"^\d+(?:\.\d+)*\.?$")
+_MARKERS_RE = re.compile(r"^[\s 📁📂📄]+")
+
+
+def find_tree_type_column(sheet: Sheet):
+    """The Folder/File column, if this sheet is a folder-tree listing."""
+    for col in sheet.columns:
+        values = {_clean(r.get(col)).lower() for r in sheet.rows} - {""}
+        if "folder" in values and values <= {"folder", "file"}:
+            return col
+    return None
+
+
+def _indent(raw: str) -> int:
+    return len(raw) - len(raw.lstrip("  \t"))
+
+
+def _tree_to_catalog(sheet: Sheet, name_col: str, link_col: str, type_col: str) -> list:
+    hier_col = next((c for c in sheet.columns if c.strip().lower() == "hierarchy"), None)
+    indents = [_indent(str(r.get(name_col) or "")) for r in sheet.rows]
+    unit = min((i for i in indents if i > 0), default=0)
+
+    stack: list = []          # (depth, folder name) of the folders we're inside
+    catalog = []
+    for row, indent in zip(sheet.rows, indents):
+        raw = fix_mojibake(str(row.get(name_col) or ""))
+        name = _MARKERS_RE.sub("", raw).strip()
+        if not name:
+            continue
+        depth = indent // unit if unit else None
+
+        if _clean(row.get(type_col)).lower() == "folder":
+            hier = _clean(row.get(hier_col)) if hier_col else ""
+            if _HIERARCHY_RE.match(hier):
+                depth = len([p for p in hier.split(".") if p]) - 1
+            depth = depth if depth is not None else 0
+            stack = [(d, n) for d, n in stack if d < depth] + [(depth, name)]
+            continue
+
+        url = _clean(row.get(link_col))
+        if not url or is_junk_file(name):
+            continue
+        parents = [n for d, n in stack if depth is None or d < depth]
+        catalog.append({
+            "file_name": name,
+            "drive_url": url,
+            "folder": " / ".join(parents) or "General",
+            "details": "",
+        })
+    return catalog
+
+
 def sheet_to_catalog(sheet: Sheet) -> list:
     """
     Turns the sheet into a list of catalogue entries:
@@ -142,6 +213,11 @@ def sheet_to_catalog(sheet: Sheet) -> list:
         logger.warning("Sheet has no Drive link column; catalogue disabled.")
         return []
     name_col = find_name_column(sheet)
+
+    type_col = find_tree_type_column(sheet)
+    if type_col:
+        return _tree_to_catalog(sheet, name_col, link_col, type_col)
+
     folder_col = find_folder_column(sheet)
     other_cols = [c for c in sheet.columns if c not in (link_col, name_col, folder_col)]
 
@@ -149,7 +225,7 @@ def sheet_to_catalog(sheet: Sheet) -> list:
     for row in sheet.rows:
         name = _clean(row.get(name_col))
         url = _clean(row.get(link_col))
-        if not name or not url:
+        if not name or not url or is_junk_file(name):
             continue
         details = "; ".join(
             f"{col}: {val}" for col in other_cols

@@ -30,7 +30,7 @@ from doc_store import DocStore
 from drive_reader import extract_file_id
 from drive_sync import configured_source, sync_from_env
 from memutil import release_memory, rss_mb
-from search import Catalog, SearchIndex, build_context, kind_of
+from search import Catalog, SearchIndex, build_context, kind_of, requested_kind, MAX_LISTED
 from sheet_utils import fetch_sheet, sheet_to_catalog, doc_key, display_name
 
 try:
@@ -139,9 +139,10 @@ def _rebuild_catalog() -> None:
     entries, seen = [], set()
     for d in _doc_meta:
         sheet = sheet_by_id.get(d["file_id"], {})
-        details = "; ".join(x for x in (kind_of(d.get("mime_type")), sheet.get("details", "")) if x)
+        kind = kind_of(d.get("mime_type"), d["name"])
+        details = "; ".join(x for x in (kind, sheet.get("details", "")) if x)
         entries.append({"file_name": d["name"], "drive_url": d["drive_url"],
-                        "folder": d.get("folder") or "General", "details": details})
+                        "folder": d.get("folder") or "General", "details": details, "kind": kind})
         seen.add(d["file_id"])
     # Sheet rows pointing outside the synced folder still show up by title.
     for fid, entry in sheet_by_id.items():
@@ -363,6 +364,7 @@ OneHope works to provide every child with God's Word and help them make a decisi
 1. Base every factual statement about OneHope's programmes, materials, numbers, and procedures on the DOCUMENT EXCERPTS or LIBRARY CATALOGUE above.
 2. The excerpts are retrieved automatically and may be unrelated to the question. If they don't contain the answer, say so plainly and point the user to the closest resources listed, or suggest they check with the OneHope Uganda team. Never invent programme names, figures, dates, or steps.
 3. Catalogue entries are titles only — you may tell the user a resource exists and what it is called, but don't describe its contents beyond what the title and details say.
+3a. When a COMPLETE LIST of one type of resource (films, audio, images, slides) is given, name every item in it — grouped by title or series, with the language when the title shows one — and tell the user the links are just below your answer.
 
 === FORMATTING RULES ===
 
@@ -399,18 +401,31 @@ Respond with a single JSON object and nothing else:
 """
 
 
-def build_context_block(doc_context: str, catalog_hits: list) -> str:
+_KIND_LABELS = {"video": "FILMS AND VIDEOS", "audio": "AUDIO", "image": "IMAGES", "slides": "SLIDE DECKS"}
+
+
+def _catalog_lines(entries: list) -> str:
+    lines = []
+    for e in entries:
+        line = f"- {display_name(e['file_name'])} (folder: {e['folder']})"
+        if e.get("details"):
+            line += f" — {e['details']}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def build_context_block(doc_context: str, catalog_hits: list,
+                        listed: Optional[list] = None, kind: Optional[str] = None) -> str:
     sections = []
+    if listed:
+        label = _KIND_LABELS.get(kind, "RESOURCES")
+        sections.append(f"=== COMPLETE LIST — {label} IN THE LIBRARY matching the question ===\n"
+                        + _catalog_lines(listed))
     if doc_context:
         sections.append(f"=== DOCUMENT EXCERPTS ===\n{doc_context}")
     if catalog_hits:
-        lines = []
-        for e in catalog_hits:
-            line = f"- {display_name(e['file_name'])} (folder: {e['folder']})"
-            if e.get("details"):
-                line += f" — {e['details']}"
-            lines.append(line)
-        sections.append("=== LIBRARY CATALOGUE — resources whose titles match the question ===\n" + "\n".join(lines))
+        sections.append("=== LIBRARY CATALOGUE — resources whose titles match the question ===\n"
+                        + _catalog_lines(catalog_hits))
     if not sections:
         return ("=== NO MATCHING RESOURCES ===\nNothing in the OneHope library matched this question. "
                 "Tell the user you couldn't find a specific resource and suggest how they could rephrase "
@@ -564,21 +579,32 @@ def chat(req: ChatRequest, user=Depends(check_rate_limit)):
 
     results = _index.search(search_query)
     doc_context, used_chunks = build_context(results)
-    catalog_hits = get_catalog().search(search_query)
+    catalog = get_catalog()
 
-    # Sources: documents the model actually saw first, then catalogue matches.
+    # "What films do we have?" — list that type of file directly, since the
+    # titles rarely contain the word the user asked with.
+    kind = requested_kind(search_query)
+    listed = catalog.list_kind(kind, search_query) if kind else []
+    listed_keys = {doc_key(e["file_name"]) for e in listed}
+    catalog_hits = [e for e in catalog.search(search_query) if doc_key(e["file_name"]) not in listed_keys]
+
+    # Sources: the listed files first (they are the answer), then documents the
+    # model actually saw, then other catalogue matches.
+    # When a type was listed, those files are the answer: show only them, so
+    # documents that merely mention "OneHope" don't crowd the links.
+    max_sources = min(len(listed), MAX_LISTED) if listed else MAX_SOURCES
     sources, seen = [], set()
-    for item in used_chunks + catalog_hits:
+    for item in listed + used_chunks + catalog_hits:
         key = doc_key(item["file_name"])
         url = item.get("drive_url", "")
-        if not url or key in seen or len(sources) >= MAX_SOURCES:
+        if not url or key in seen or len(sources) >= max_sources:
             continue
         seen.add(key)
         sources.append(Source(file_name=display_name(item["file_name"]), drive_url=url,
                               folder=item.get("folder") or "General"))
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT.format(
-        context_block=build_context_block(doc_context, catalog_hits))}]
+        context_block=build_context_block(doc_context, catalog_hits, listed, kind))}]
     for turn in req.conversation_history[-MAX_HISTORY_TURNS:]:
         if turn.content.strip():
             messages.append({
@@ -599,6 +625,7 @@ def chat(req: ChatRequest, user=Depends(check_rate_limit)):
         suggestions = _str_list(parsed.get("suggestions"), 3)
 
     logger.info(f"Responded. Chunks: {len(used_chunks)} | Catalogue: {len(catalog_hits)} | "
+                f"Listed {kind or '-'}: {len(listed)} | "
                 f"Sources: {len(sources)} | Clarification: {needs_clarification}")
     return ChatResponse(answer=answer, sources=sources, suggestions=suggestions,
                         needs_clarification=needs_clarification)
