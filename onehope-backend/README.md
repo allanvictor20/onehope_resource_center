@@ -32,7 +32,9 @@ User question ──► POST /chat ──► search passages + catalogue ──�
   catalogue of every file — including videos and images, which have no text.
 - **Optional sheet**: if `SHEET_CSV_URL` is set, extra columns from the resource sheet
   (language, audience…) are attached to matching files to improve search. The sheet is
-  no longer needed for anything to appear.
+  no longer needed for anything to appear. The "Folder Structure" sheet layout
+  (Hierarchy | Name | Type | Size | Link, with indented names) is recognised: each file
+  gets its full folder path, and folder rows are skipped.
 
 ---
 
@@ -120,7 +122,8 @@ python3 -c "import json; print(json.dumps(json.load(open('service_account.json')
 | Type | Result |
 |---|---|
 | PDF, .docx, .pptx, .xlsx, Google Docs / Slides / Sheets | Full text searchable |
-| Video, audio, images | Found by title and folder (e.g. "what films do we have in Luganda?") |
+| Video, audio, images | Found by title and folder. Questions naming a type ("what movies do we have?", "films in Luganda", "any trailers?") get the complete list of that type, each as a link |
+| `.DS_Store`, `Thumbs.db`, `._` copies | Ignored |
 | Scanned PDFs (no text layer) | Found by title only |
 | Old .doc / .ppt, other formats | Found by title only |
 | Files over `MAX_FILE_MB` | Found by title only |

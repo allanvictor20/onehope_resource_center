@@ -27,6 +27,7 @@ from typing import Callable, Optional
 
 from doc_store import DocStore, INDEXED, MEDIA, UNSUPPORTED, TOO_LARGE, EMPTY, ERROR
 from memutil import release_memory
+from sheet_utils import is_junk_file
 from drive_reader import (
     _retry_call, extract_file_id, extract_text, get_drive_service, is_extractable, is_media,
 )
@@ -132,6 +133,8 @@ def list_folder_files(service, root_folder_id: str) -> list:
                         queue.append((f["id"], sub))
                     continue
 
+                if is_junk_file(f.get("name", "")):     # .DS_Store and friends
+                    continue
                 found[f["id"]] = _file_record(f, path)
 
             page_token = resp.get("nextPageToken")
